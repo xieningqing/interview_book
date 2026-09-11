@@ -1,8 +1,12 @@
-# 敏感数据 —— 绝不能提交到仓库！
+# 敏感数据 / 运行时数据 —— 不提交到仓库！
 data/cookies.json
+data/proxies.json
+data/txt/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+# 例外：只提交一份仅含表结构的初始化空库（运行后本地数据不会被跟踪）
+!data/interview.db
 
 # Python
 __pycache__/
