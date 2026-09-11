@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}面经库 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">面经库</h1>
+        <p class="page-sub">
+            共 {{ interviews|length }} 篇
+            {% if selected_keyword %}· 当前筛选「{{ selected_keyword.name }}」{% endif %}
+        </p>
+    </div>
+</div>
+
+<div class="card filter-card">
+    <form method="get" action="/interviews" class="filter-form">
+        <label for="kw-filter">关键词筛选</label>
+        <select id="kw-filter" name="keyword_id" onchange="this.form.submit()">
+            <option value="">全部关键词</option>
+            {% for kw in keywords %}
+            <option value="{{ kw.id }}" {% if selected_keyword and selected_keyword.id == kw.id %}selected{% endif %}>
+                {{ kw.name }}
+            </option>
+            {% endfor %}
+        </select>
+    </form>
+    {% if selected_keyword %}
+    <a href="/interviews" class="btn btn-sm btn-ghost">
+        <svg class="icon"><use href="#i-x"/></svg><span>清除筛选</span>
+    </a>
+    {% endif %}
+</div>
+
+{% if interviews %}
+<div class="interview-grid">
+    {% for inv in interviews %}
+    <a class="interview-card" href="/interviews/{{ inv.id }}">
+        <div class="inv-meta">
+            <span><svg class="icon"><use href="#i-calendar"/></svg>{{ inv.publish_time[:10] if inv.publish_time else '日期未知' }}</span>
+            {% if inv.author %}
+            <span><svg class="icon"><use href="#i-user"/></svg>{{ inv.author }}</span>
+            {% endif %}
+        </div>
+        <div class="inv-title">{{ inv.title }}</div>
+        {% if inv.school or inv.position or inv.tags %}
+        <div class="inv-info">
+            {% if inv.school %}<span class="tag">{{ inv.school }}</span>{% endif %}
+            {% if inv.position %}<span class="tag tag-pos">{{ inv.position }}</span>{% endif %}
+            {% for t in inv.tags or [] %}
+            <span class="tag {% if t == '重复标题' %}tag-dup{% endif %}">{{ t }}</span>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <div class="inv-preview">{{ inv.content_preview }}</div>
+        {% if inv.questions %}
+        <div class="inv-footer">
+            <svg class="icon"><use href="#i-help"/></svg>{{ inv.questions|length }} 道面试问题
+        </div>
+        {% endif %}
+    </a>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty">
+    <div class="empty-badge">
+        <svg class="icon"><use href="#i-book"/></svg>
+    </div>
+    <div class="empty-title">暂无面经数据</div>
+    <div class="empty-sub">完成一次爬取任务后，采集到的面经将自动收录并显示在这里</div>
+    <a href="/" class="btn btn-primary btn-sm empty-action">
+        <svg class="icon"><use href="#i-zap"/></svg><span>前往发起爬取</span>
+    </a>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,608 @@
+{% extends "base.html" %}
+{% block title %}关键词控制台 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">关键词控制台</h1>
+        <p class="page-sub">管理搜索关键词 · 发起爬取 · 实时监控抓取进度</p>
+    </div>
+    <button class="btn btn-lg btn-primary" onclick="document.getElementById('kw-name').focus()">
+        <svg class="icon"><use href="#i-plus"/></svg><span>新建关键词</span>
+    </button>
+</div>
+
+<!-- 统计概览 -->
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="stat-icon tone-green"><svg class="icon"><use href="#i-key"/></svg></div>
+        <div class="stat-info">
+            <div class="stat-value">{{ stats.keyword_count }}</div>
+            <div class="stat-label">关键词</div>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-blue"><svg class="icon"><use href="#i-file"/></svg></div>
+        <div class="stat-info">
+            <div class="stat-value">{{ stats.interview_count }}</div>
+            <div class="stat-label">面经篇数</div>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-purple"><svg class="icon"><use href="#i-help"/></svg></div>
+        <div class="stat-info">
+            <div class="stat-value">{{ stats.question_count }}</div>
+            <div class="stat-label">面试问题</div>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-amber"><svg class="icon"><use href="#i-clock"/></svg></div>
+        <div class="stat-info">
+            <div class="stat-value stat-value-sm">{{ stats.latest_interview[:10] if stats.latest_interview else '—' }}</div>
+            <div class="stat-label">最新面经日期</div>
+        </div>
+    </div>
+</div>
+
+<!-- 添加关键词 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-plus"/></svg>添加关键词</div>
+        <span class="card-note">保存后可随时重复爬取</span>
+    </div>
+    <form id="keyword-form" class="form-inline">
+        <div class="form-group grow">
+            <label for="kw-name">搜索关键词</label>
+            <input type="text" id="kw-name" placeholder="如：agent面经、字节Java后端" required>
+        </div>
+        <div class="form-group">
+            <label for="kw-days">时间范围 <span class="unit">/ 天</span></label>
+            <input type="number" id="kw-days" value="30" min="1" max="365">
+        </div>
+        <div class="form-group">
+            <label for="kw-pages">搜索页数</label>
+            <input type="number" id="kw-pages" value="5" min="1" max="20">
+        </div>
+        <div class="form-group">
+            <label for="kw-max">最多爬取</label>
+            <input type="number" id="kw-max" value="30" min="1" max="200">
+        </div>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-ghost">
+                <svg class="icon"><use href="#i-save"/></svg><span>保存关键词</span>
+            </button>
+            <button type="button" id="crawl-now-btn" class="btn btn-primary">
+                <svg class="icon"><use href="#i-zap"/></svg><span>保存并立即爬取</span>
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- 发起爬取 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-zap"/></svg>发起爬取</div>
+        <span class="card-note">选择已保存关键词，或临时输入一个直接跑</span>
+    </div>
+    <form id="quick-crawl-form" class="form-inline">
+        <div class="form-group grow">
+            <label for="quick-select">选择关键词</label>
+            <select id="quick-select">
+                <option value="">— 手动输入新关键词 —</option>
+                {% for kw in keywords %}
+                <option value="{{ kw.id }}"
+                        data-name="{{ kw.name }}"
+                        data-days="{{ kw.days_filter }}"
+                        data-max="{{ kw.max_posts }}">{{ kw.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group grow" id="quick-query-group">
+            <label for="quick-query">新关键词</label>
+            <input type="text" id="quick-query" placeholder="如：大模型面经">
+        </div>
+        <div class="form-group">
+            <label for="quick-days">时间范围 <span class="unit">/ 天</span></label>
+            <input type="number" id="quick-days" value="30" min="1" max="365">
+        </div>
+        <div class="form-group">
+            <label for="quick-max">最多爬取</label>
+            <input type="number" id="quick-max" value="20" min="1" max="100">
+        </div>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">
+                <svg class="icon"><use href="#i-play"/></svg><span>开始爬取</span>
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- 爬取进度面板 -->
+<div id="task-panel" class="card hidden">
+    <div class="card-head">
+        <div class="card-title">
+            <svg class="icon"><use href="#i-activity"/></svg>爬取进度
+            <span class="live-dot" id="live-dot"></span>
+        </div>
+        <div class="btn-group">
+            <button id="stop-task-btn" class="btn btn-sm btn-danger" style="display:none;" onclick="stopTask()">
+                <svg class="icon"><use href="#i-stop"/></svg><span>停止</span>
+            </button>
+            <button class="btn btn-sm btn-ghost" onclick="hidePanel()">
+                <svg class="icon"><use href="#i-x"/></svg><span>收起</span>
+            </button>
+        </div>
+    </div>
+
+    <div class="phase-flow">
+        <div class="phase-step" id="phase-start">
+            <div class="phase-icon"><svg class="icon"><use href="#i-flag"/></svg></div>
+            <div class="phase-label">启动</div>
+        </div>
+        <div class="phase-arrow"><svg class="icon"><use href="#i-ff"/></svg></div>
+        <div class="phase-step" id="phase-search">
+            <div class="phase-icon"><svg class="icon"><use href="#i-search"/></svg></div>
+            <div class="phase-label">搜索面经</div>
+            <div class="phase-sub" id="phase-search-sub">—</div>
+        </div>
+        <div class="phase-arrow"><svg class="icon"><use href="#i-ff"/></svg></div>
+        <div class="phase-step" id="phase-detail">
+            <div class="phase-icon"><svg class="icon"><use href="#i-download"/></svg></div>
+            <div class="phase-label">抓取详情</div>
+            <div class="phase-sub" id="phase-detail-sub">—</div>
+        </div>
+        <div class="phase-arrow"><svg class="icon"><use href="#i-ff"/></svg></div>
+        <div class="phase-step" id="phase-complete">
+            <div class="phase-icon"><svg class="icon"><use href="#i-target"/></svg></div>
+            <div class="phase-label">完成</div>
+        </div>
+    </div>
+
+    <div class="progress-main">
+        <div class="progress-bar-container">
+            <div id="progress-bar" class="progress-bar"></div>
+        </div>
+        <div class="progress-text" id="progress-text">
+            <svg class="icon"><use href="#i-clock"/></svg>准备中…
+        </div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="mini-stat">
+            <span class="mini-num" id="stat-pages">0</span>
+            <span class="mini-label"><svg class="icon"><use href="#i-layers"/></svg>搜索页数</span>
+        </div>
+        <div class="mini-stat stat-success">
+            <span class="mini-num" id="stat-success">0</span>
+            <span class="mini-label"><svg class="icon"><use href="#i-check"/></svg>成功</span>
+        </div>
+        <div class="mini-stat stat-fail">
+            <span class="mini-num" id="stat-failed">0</span>
+            <span class="mini-label"><svg class="icon"><use href="#i-x-circle"/></svg>失败</span>
+        </div>
+        <div class="mini-stat stat-risk">
+            <span class="mini-num" id="stat-risk">0</span>
+            <span class="mini-label"><svg class="icon"><use href="#i-alert"/></svg>风控</span>
+        </div>
+    </div>
+
+    <details class="requests-details" open>
+        <summary><svg class="icon"><use href="#i-terminal"/></svg>实时请求日志</summary>
+        <div id="requests-list" class="requests-list"></div>
+    </details>
+</div>
+
+<!-- 已保存关键词 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title">
+            <svg class="icon"><use href="#i-list"/></svg>已保存的关键词
+            {% if keywords %}<span class="count-pill">{{ keywords|length }}</span>{% endif %}
+        </div>
+        {% if keywords %}
+        <button class="btn btn-sm btn-primary" onclick="crawlAll()">
+            <svg class="icon"><use href="#i-play"/></svg><span>爬取全部</span>
+        </button>
+        {% endif %}
+    </div>
+
+    {% if keywords %}
+    <div class="table-wrap">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>关键词</th>
+                    <th>时间范围</th>
+                    <th>页数</th>
+                    <th>最多爬取</th>
+                    <th>上次爬取</th>
+                    <th class="col-actions">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for kw in keywords %}
+                <tr>
+                    <td><span class="kw-name">{{ kw.name }}</span></td>
+                    <td><span class="chip">近 {{ kw.days_filter }} 天</span></td>
+                    <td class="mono muted">{{ kw.max_pages }}</td>
+                    <td class="mono muted">{{ kw.max_posts }}</td>
+                    <td class="mono muted">
+                        {% if kw.last_crawled_at %}{{ kw.last_crawled_at[:16]|replace('T', ' ') }}
+                        {% else %}<span class="never">从未</span>{% endif %}
+                    </td>
+                    <td class="col-actions">
+                        <div class="btn-group">
+                            <button class="btn btn-sm btn-primary" onclick="crawlById({{ kw.id }})" title="爬取此关键词">
+                                <svg class="icon"><use href="#i-refresh"/></svg><span>爬取</span>
+                            </button>
+                            <button class="btn btn-sm btn-ghost" onclick="viewByKeyword({{ kw.id }})" title="查看面经">
+                                <svg class="icon"><use href="#i-eye"/></svg><span>查看</span>
+                            </button>
+                            <button class="btn btn-sm btn-danger btn-icon" onclick="deleteKeyword({{ kw.id }})" title="删除">
+                                <svg class="icon"><use href="#i-trash"/></svg>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty">
+        <div class="empty-badge">
+            <svg class="icon"><use href="#i-key"/></svg>
+        </div>
+        <div class="empty-title">还没有保存关键词</div>
+        <div class="empty-sub">在上方输入关键词并保存，例如「agent 面经」</div>
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ============ 关键词管理 ============
+document.getElementById('keyword-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await saveKeyword(false);
+});
+document.getElementById('crawl-now-btn').addEventListener('click', () => saveKeyword(true));
+
+async function saveKeyword(crawlAfter) {
+    const name = document.getElementById('kw-name').value.trim();
+    if (!name) { showFeed('请输入关键词', 'error'); return; }
+
+    const payload = {
+        name: name,
+        days_filter: parseInt(document.getElementById('kw-days').value, 10) || 30,
+        max_pages: parseInt(document.getElementById('kw-pages').value, 10) || 5,
+        max_posts: parseInt(document.getElementById('kw-max').value, 10) || 30,
+    };
+
+    const resp = await fetch('/api/keywords', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    const result = await resp.json();
+    if (!resp.ok) { showFeed('保存失败：' + (result.detail || '未知错误'), 'error'); return; }
+
+    if (crawlAfter && result.id) {
+        document.getElementById('keyword-form').reset();
+        document.getElementById('kw-days').value = 30;
+        document.getElementById('kw-pages').value = 5;
+        document.getElementById('kw-max').value = 30;
+        startTask({ keyword_id: result.id });
+    } else {
+        location.reload();
+    }
+}
+
+async function deleteKeyword(id) {
+    if (!confirm('确定删除此关键词？关联的面经也会被一并删除。')) return;
+    await fetch(`/api/keywords/${id}`, { method: 'DELETE' });
+    location.reload();
+}
+
+// ============ 发起爬取（下拉选择 / 临时输入）============
+const quickSelect = document.getElementById('quick-select');
+const quickQueryGroup = document.getElementById('quick-query-group');
+const quickQuery = document.getElementById('quick-query');
+
+function syncQuickForm() {
+    const opt = quickSelect.selectedOptions[0];
+    if (opt && opt.value) {
+        // 选中已保存关键词：隐藏手动输入，回填其参数
+        quickQueryGroup.style.display = 'none';
+        quickQuery.required = false;
+        document.getElementById('quick-days').value = opt.dataset.days || 30;
+        document.getElementById('quick-max').value = opt.dataset.max || 20;
+    } else {
+        quickQueryGroup.style.display = '';
+        quickQuery.required = true;
+    }
+}
+quickSelect.addEventListener('change', syncQuickForm);
+syncQuickForm();
+
+document.getElementById('quick-crawl-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const kid = quickSelect.value;
+    if (kid) {
+        startTask({
+            keyword_id: parseInt(kid, 10),
+            days_filter: parseInt(document.getElementById('quick-days').value, 10) || 30,
+            max_posts: parseInt(document.getElementById('quick-max').value, 10) || 20,
+        });
+        return;
+    }
+    const query = quickQuery.value.trim();
+    if (!query) { showFeed('请输入关键词', 'error'); return; }
+    startTask({
+        query: query,
+        days_filter: parseInt(document.getElementById('quick-days').value, 10) || 30,
+        max_posts: parseInt(document.getElementById('quick-max').value, 10) || 20,
+    });
+});
+
+async function crawlById(keywordId) {
+    startTask({ keyword_id: keywordId });
+}
+
+async function crawlAll() {
+    if (!confirm('确定爬取全部关键词？')) return;
+    const resp = await fetch('/api/crawl-all', { method: 'POST' });
+    if (resp.ok) showFeed('已启动全部关键词任务', 'success');
+    else showFeed('启动失败', 'error');
+}
+
+function viewByKeyword(id) {
+    window.location.href = `/interviews?keyword_id=${id}`;
+}
+
+function setStopButton(state) {
+    // state: 'running'（可停止） | 'off'（隐藏/禁用）
+    const btn = document.getElementById('stop-task-btn');
+    if (state === 'running') {
+        btn.disabled = false;
+        btn.style.display = '';
+        btn.innerHTML = svg('#i-stop') + '<span>停止</span>';
+    } else {
+        btn.disabled = true;
+        btn.style.display = 'none';
+    }
+}
+
+async function stopTask() {
+    if (!currentTaskId) return;
+    if (!confirm('确定停止当前爬取任务？已抓取的面经会保留入库。')) return;
+    const btn = document.getElementById('stop-task-btn');
+    btn.disabled = true;
+    btn.innerHTML = svg('#i-stop') + '<span>停止中…</span>';
+    try {
+        const resp = await fetch(`/api/task/${currentTaskId}/stop`, { method: 'POST' });
+        const result = await resp.json();
+        if (!resp.ok) { showFeed(result.detail || '停止失败', 'error'); setStopButton('running'); }
+        else showFeed(result.message || '正在停止…', 'info');
+    } catch (e) {
+        showFeed('停止请求失败：' + e.message, 'error');
+        setStopButton('running');
+    }
+}
+
+function hidePanel() {
+    document.getElementById('task-panel').classList.add('hidden');
+    if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+    currentTaskId = null;
+    setStopButton('off');
+}
+
+// ============ 任务进度 ============
+let currentTaskId = null;
+let progressTimer = null;
+let lastStepCount = 0;
+
+const STATUS_ICON = {
+    success: '#i-check', failed: '#i-x-circle',
+    skipped: '#i-skip', risk: '#i-alert',
+};
+const PHASE_ICON = { search: '#i-search', detail: '#i-download', complete: '#i-target' };
+const PHASE_TEXT = { search: '搜索', detail: '抓取', complete: '完成' };
+
+function svg(href) {
+    return `<svg class="icon"><use href="${href}"/></svg>`;
+}
+
+async function startTask(payload) {
+    const panel = document.getElementById('task-panel');
+    panel.classList.remove('hidden');
+
+    document.getElementById('progress-bar').style.width = '0%';
+    document.getElementById('progress-text').innerHTML = svg('#i-clock') + '准备中…';
+    document.getElementById('requests-list').innerHTML = '';
+    document.getElementById('live-dot').classList.add('on');
+    document.querySelectorAll('.phase-step').forEach(el =>
+        el.classList.remove('active', 'done', 'failed', 'risk'));
+    ['stat-pages', 'stat-success', 'stat-failed', 'stat-risk'].forEach(id => {
+        document.getElementById(id).textContent = '0';
+    });
+    document.getElementById('phase-search-sub').textContent = '—';
+    document.getElementById('phase-detail-sub').textContent = '—';
+    lastStepCount = 0;
+
+    const resp = await fetch('/api/crawl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    const result = await resp.json();
+    if (!resp.ok || !result.task_id) {
+        document.getElementById('live-dot').classList.remove('on');
+        document.getElementById('progress-text').innerHTML =
+            svg('#i-x-circle') + '启动失败：' + (result.detail || '未知错误');
+        return;
+    }
+
+    currentTaskId = result.task_id;
+    setStopButton('running');
+    panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = setInterval(pollProgress, 800);
+}
+
+function updatePhaseFlow(steps) {
+    const latest = steps[steps.length - 1];
+    if (!latest) return;
+
+    const start = document.getElementById('phase-start');
+    const search = document.getElementById('phase-search');
+    const detail = document.getElementById('phase-detail');
+    const done = document.getElementById('phase-complete');
+    start.classList.add('done');
+
+    if (latest.phase === 'search') {
+        search.classList.add('active');
+    } else if (latest.phase === 'detail') {
+        search.classList.remove('active');
+        search.classList.add('done');
+        detail.classList.add('active');
+    } else if (latest.phase === 'complete') {
+        search.classList.add('done');
+        detail.classList.add('done');
+        done.classList.add('active', 'done');
+    }
+
+    if (latest.status === 'risk') { search.classList.add('risk'); detail.classList.add('risk'); }
+    if (latest.status === 'failed') {
+        (latest.phase === 'detail' ? detail : search).classList.add('failed');
+    }
+}
+
+function updateStats(stats) {
+    document.getElementById('stat-pages').textContent = stats.search_pages || 0;
+    document.getElementById('stat-success').textContent = stats.detail_success || 0;
+    document.getElementById('stat-failed').textContent = stats.detail_failed || 0;
+    document.getElementById('stat-risk').textContent = stats.risk_hits || 0;
+
+    document.getElementById('phase-search-sub').textContent = `${stats.search_pages || 0} 页`;
+    // X/Y = 有效面经数 / 目标数；正文过短的不占名额，会继续翻页补够
+    const target = stats.detail_total || 0;
+    const sub = document.getElementById('phase-detail-sub');
+    if (target > 0) sub.textContent = `${stats.detail_success || 0}/${target}`;
+    else if ((stats.search_pages || 0) > 0) sub.textContent = '等待中…';
+}
+
+function renderNewSteps(newSteps) {
+    const list = document.getElementById('requests-list');
+    const frag = document.createDocumentFragment();
+
+    newSteps.forEach(step => {
+        const row = document.createElement('div');
+        row.className = `req-row req-${step.status || 'info'}`;
+
+        const phase = document.createElement('span');
+        phase.className = 'req-phase';
+        phase.innerHTML = svg(PHASE_ICON[step.phase] || '#i-info') +
+            (PHASE_TEXT[step.phase] || '信息');
+
+        const status = document.createElement('span');
+        status.className = 'req-status';
+        status.innerHTML = svg(STATUS_ICON[step.status] || '#i-info');
+
+        const msg = document.createElement('span');
+        msg.className = 'req-msg';
+        msg.textContent = step.message || '';
+
+        row.append(phase, status, msg);
+        frag.appendChild(row);
+    });
+
+    list.appendChild(frag);
+    while (list.children.length > 500) list.removeChild(list.firstChild);
+    list.scrollTop = list.scrollHeight;
+}
+
+async function pollProgress() {
+    if (!currentTaskId) return;
+
+    let data;
+    try {
+        const resp = await fetch(`/api/task/${currentTaskId}/progress`);
+        if (!resp.ok) return;
+        data = await resp.json();
+    } catch (e) {
+        return;
+    }
+
+    const steps = data.steps || [];
+    if (steps.length > lastStepCount) {
+        renderNewSteps(steps.slice(lastStepCount));
+        updatePhaseFlow(steps);
+        lastStepCount = steps.length;
+    }
+    if (data.stats) updateStats(data.stats);
+
+    const latest = steps[steps.length - 1];
+    const bar = document.getElementById('progress-bar');
+    const text = document.getElementById('progress-text');
+    if (latest && latest.total > 0) {
+        const pct = Math.round(latest.current / latest.total * 100);
+        bar.style.width = pct + '%';
+        text.innerHTML = svg('#i-activity') +
+            `${PHASE_TEXT[latest.phase] || '处理'} ${latest.current}/${latest.total} · ${pct}%`;
+    } else if (latest) {
+        text.innerHTML = svg('#i-terminal') + (latest.message || '');
+    }
+
+    if (data.status === 'done') {
+        stopPolling();
+        bar.style.width = '100%';
+        const r = data.result || {};
+        text.innerHTML = svg('#i-check') +
+            `完成 · 新增 ${r.new_saved || 0} 篇 · 已存在 ${r.already_exists || 0} 篇` +
+            (r.dup_titles ? ` · 重复标题 ${r.dup_titles} 篇` : '');
+        showFeed('爬取完成，即将刷新列表', 'success');
+        setTimeout(() => location.reload(), 2600);
+    } else if (data.status === 'stopped') {
+        stopPolling();
+        document.getElementById('phase-complete').classList.add('done');
+        const r = data.result || {};
+        text.innerHTML = svg('#i-stop') +
+            `已停止 · 已保留新增 ${r.new_saved || 0} 篇，即将刷新…`;
+        showFeed('任务已停止，已抓取的面经已保留', 'info');
+        setTimeout(() => location.reload(), 2600);
+    } else if (data.status === 'failed') {
+        stopPolling();
+        document.getElementById('phase-complete').classList.add('failed');
+        text.innerHTML = svg('#i-x-circle') + '任务失败，详见下方日志';
+    }
+}
+
+function stopPolling() {
+    if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+    currentTaskId = null;
+    document.getElementById('live-dot').classList.remove('on');
+    setStopButton('off');
+}
+
+// ============ Toast ============
+let _feedEl = null;
+let _feedTimer = null;
+function showFeed(msg, type) {
+    if (!_feedEl) {
+        _feedEl = document.createElement('div');
+        _feedEl.id = 'page-feedback';
+        document.body.appendChild(_feedEl);
+    }
+    const icon = type === 'success' ? '#i-check' : type === 'error' ? '#i-x-circle' : '#i-info';
+    _feedEl.className = 'feedback feedback-' + (type || 'info');
+    _feedEl.innerHTML = svg(icon) + `<span></span>`;
+    _feedEl.querySelector('span').textContent = msg;
+    clearTimeout(_feedTimer);
+    _feedTimer = setTimeout(() => _feedEl.classList.add('hidden'), 3500);
+}
+</script>
+{% endblock %}

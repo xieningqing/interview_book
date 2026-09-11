@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}IP 代理配置 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">IP 代理管理</h1>
+        <p class="page-sub">爬虫每次请求自动从池中选取代理 · 数据存于本地 <code>data/proxies.json</code></p>
+    </div>
+</div>
+
+<!-- 当前状态 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-server"/></svg>当前状态</div>
+        <span class="card-note">轮换策略决定每次请求如何挑选代理</span>
+    </div>
+
+    {% if proxy_status.enabled %}
+    <div class="status-ok">
+        <span class="status-dot ok"></span>
+        <strong>已启用</strong>
+        <span>{{ proxy_status.count }} 个代理</span>
+        <span>策略 {{ proxy_status.strategy }}</span>
+        {% if proxy_status.updated_at %}<span>更新于 {{ proxy_status.updated_at[:19] }}</span>{% endif %}
+    </div>
+    {% elif proxy_status.count > 0 %}
+    <div class="status-warn">
+        <span class="status-dot warn"></span>
+        <strong>已禁用</strong>
+        <span>{{ proxy_status.count }} 个代理已保存但未启用，当前走直连</span>
+    </div>
+    {% else %}
+    <div class="status-warn">
+        <span class="status-dot warn"></span>
+        <strong>未配置代理</strong>
+        <span>当前直连牛客，高频爬取可能被风控</span>
+    </div>
+    {% endif %}
+
+    {% if proxy_status.count > 0 %}
+    <details class="cookie-details">
+        <summary><svg class="icon"><use href="#i-eye"/></svg>查看代理列表（凭据已脱敏）</summary>
+        <div class="table-wrap" style="margin-top:10px;">
+            <table class="data-table">
+                <thead><tr><th>代理地址</th></tr></thead>
+                <tbody>
+                    {% for p in proxy_status.proxies %}
+                    <tr><td><code class="masked">{{ p }}</code></td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </details>
+    {% endif %}
+</div>
+
+<!-- 更新 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-save"/></svg>更新代理</div>
+        <span class="card-note">保存会整体替换代理池，请填完整列表</span>
+    </div>
+
+    <div class="form-inline" style="margin-bottom:14px;">
+        <div class="form-group">
+            <label for="px-enabled">启用代理</label>
+            <select id="px-enabled">
+                <option value="true" {% if proxy_status.enabled %}selected{% endif %}>启用</option>
+                <option value="false" {% if not proxy_status.enabled %}selected{% endif %}>禁用</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="px-strategy">轮换策略</label>
+            <select id="px-strategy">
+                <option value="round_robin" {% if proxy_status.strategy == 'round_robin' %}selected{% endif %}>round_robin · 轮询</option>
+                <option value="random" {% if proxy_status.strategy == 'random' %}selected{% endif %}>random · 随机</option>
+                <option value="first" {% if proxy_status.strategy == 'first' %}selected{% endif %}>first · 固定首个</option>
+            </select>
+        </div>
+    </div>
+
+    <p class="hint">
+        每行一个代理地址，支持
+        <code>http://host:port</code>、<code>http://user:pass@host:port</code>、<code>socks5://host:port</code>。
+    </p>
+    <textarea id="px-proxy-text" rows="6"
+              placeholder="http://127.0.0.1:7890&#10;http://user:pass@proxy.example.com:8080&#10;socks5://10.0.0.1:1080"></textarea>
+
+    <div class="form-actions" style="margin-top:14px;">
+        <button class="btn btn-primary" onclick="saveProxy()">
+            <svg class="icon"><use href="#i-save"/></svg><span>保存</span>
+        </button>
+        <button class="btn btn-ghost" onclick="testProxy()">
+            <svg class="icon"><use href="#i-activity"/></svg><span>测试首个代理</span>
+        </button>
+        <button class="btn btn-danger" onclick="clearProxy()">
+            <svg class="icon"><use href="#i-trash"/></svg><span>清空</span>
+        </button>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function saveProxy() {
+    const enabled = document.getElementById('px-enabled').value === 'true';
+    const proxyText = document.getElementById('px-proxy-text').value.trim();
+
+    if (enabled && !proxyText) {
+        showFeed('启用状态下至少需要一个代理地址；若只想改策略，请先选「禁用」或填入代理', 'error');
+        return;
+    }
+
+    showFeed('保存中…', 'info');
+    const resp = await fetch('/api/proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            enabled: enabled,
+            strategy: document.getElementById('px-strategy').value,
+            proxy_text: proxyText,
+        }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+        showFeed(data.message, 'success');
+        setTimeout(() => location.reload(), 800);
+    } else {
+        showFeed('保存失败：' + (data.detail || '未知错误'), 'error');
+    }
+}
+
+async function testProxy() {
+    showFeed('测试中，最长 10 秒…', 'info');
+    try {
+        const resp = await fetch('/api/proxy/test', { method: 'POST' });
+        const data = await resp.json();
+        showFeed(data.message, data.ok ? 'success' : 'error');
+    } catch (e) {
+        showFeed('测试请求失败：' + e.message, 'error');
+    }
+}
+
+async function clearProxy() {
+    if (!confirm('确定清空全部代理？清空后将恢复直连。')) return;
+    await fetch('/api/proxy', { method: 'DELETE' });
+    location.reload();
+}
+
+let _feedEl = null;
+let _feedTimer = null;
+function showFeed(msg, type) {
+    if (!_feedEl) {
+        _feedEl = document.createElement('div');
+        document.body.appendChild(_feedEl);
+    }
+    const icon = type === 'success' ? '#i-check' : type === 'error' ? '#i-x-circle' : '#i-info';
+    _feedEl.className = 'feedback feedback-' + (type || 'info');
+    _feedEl.innerHTML = `<svg class="icon"><use href="${icon}"/></svg><span></span>`;
+    _feedEl.querySelector('span').textContent = msg;
+    clearTimeout(_feedTimer);
+    _feedTimer = setTimeout(() => _feedEl.classList.add('hidden'), 4000);
+}
+</script>
+{% endblock %}

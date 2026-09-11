@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}爬取日志 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">爬取日志</h1>
+        <p class="page-sub">
+            共 {{ tasks|length }} 条任务记录 · 每次任务完成后自动归档至本地 SQLite
+        </p>
+    </div>
+    {% if tasks %}
+    <button class="btn btn-sm btn-danger" onclick="clearAll()">
+        <svg class="icon"><use href="#i-trash"/></svg><span>清空全部日志</span>
+    </button>
+    {% endif %}
+</div>
+
+{% if tasks %}
+<div class="card" style="padding:0;border:none;background:none;">
+    <div class="table-wrap">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th style="width:150px;">任务 ID</th>
+                    <th>关键词</th>
+                    <th style="width:90px;">状态</th>
+                    <th style="width:70px;">步骤</th>
+                    <th style="width:60px;">成功</th>
+                    <th style="width:60px;">失败</th>
+                    <th style="width:60px;">风控</th>
+                    <th style="width:160px;">开始时间</th>
+                    <th class="col-actions">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in tasks %}
+                {% set stats = t.stats or {} %}
+                <tr>
+                    <td class="mono muted" style="font-size:12px;">
+                        <details>
+                            <summary style="cursor:pointer;">{{ t.task_id[:16] }}…</summary>
+                            <div style="padding-top:6px;word-break:break-all;">{{ t.task_id }}</div>
+                        </details>
+                    </td>
+                    <td><strong>{{ t.query }}</strong></td>
+                    <td>
+                        {% if t.status == 'done' %}
+                        <span class="status-badge b-ok"><svg class="icon"><use href="#i-check"/></svg>完成</span>
+                        {% elif t.status == 'failed' %}
+                        <span class="status-badge b-bad"><svg class="icon"><use href="#i-x-circle"/></svg>失败</span>
+                        {% elif t.status == 'risk' %}
+                        <span class="status-badge b-risk"><svg class="icon"><use href="#i-alert"/></svg>风控</span>
+                        {% elif t.status == 'running' %}
+                        <span class="status-badge b-info"><svg class="icon"><use href="#i-activity"/></svg>进行中</span>
+                        {% elif t.status == 'stopped' %}
+                        <span class="status-badge b-stop"><svg class="icon"><use href="#i-stop"/></svg>已停止</span>
+                        {% else %}
+                        <span class="status-badge b-info">{{ t.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono muted">{{ t.steps_count if t.steps_count is defined else (t.steps|length if t.steps else 0) }}</td>
+                    <td class="mono text-green">{{ stats.detail_success or 0 }}</td>
+                    <td class="mono text-red">{{ stats.detail_failed or 0 }}</td>
+                    <td class="mono text-orange">{{ stats.risk_hits or 0 }}</td>
+                    <td class="mono muted" style="font-size:12px;">{{ t.started_at[:19]|replace('T', ' ') if t.started_at else '—' }}</td>
+                    <td class="col-actions">
+                        <div class="btn-group">
+                            <button class="btn btn-sm btn-ghost" onclick="viewTask('{{ t.task_id }}')">
+                                <svg class="icon"><use href="#i-eye"/></svg><span>详情</span>
+                            </button>
+                            <button class="btn btn-sm btn-danger btn-icon" onclick="deleteTask('{{ t.task_id }}')" title="删除此记录">
+                                <svg class="icon"><use href="#i-trash"/></svg>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="empty">
+    <div class="empty-badge">
+        <svg class="icon"><use href="#i-activity"/></svg>
+    </div>
+    <div class="empty-title">暂无爬取记录</div>
+    <div class="empty-sub">完成一次爬取任务后，执行状态与完整请求日志将自动归档并显示在这里</div>
+    <a href="/" class="btn btn-primary btn-sm empty-action">
+        <svg class="icon"><use href="#i-zap"/></svg><span>前往发起爬取</span>
+    </a>
+</div>
+{% endif %}
+
+<!-- 详情弹窗 -->
+<div id="task-modal" class="modal hidden">
+    <div class="modal-overlay" onclick="closeModal()"></div>
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="modal-title">任务详情</h3>
+            <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal()" title="关闭">
+                <svg class="icon"><use href="#i-x"/></svg>
+            </button>
+        </div>
+        <div id="modal-body" class="modal-body"></div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const STATUS_ICON = {
+    success: '#i-check', failed: '#i-x-circle',
+    skipped: '#i-skip', risk: '#i-alert',
+};
+
+function esc(text) {
+    const d = document.createElement('div');
+    d.textContent = text == null ? '' : String(text);
+    return d.innerHTML;
+}
+
+async function viewTask(taskId) {
+    const resp = await fetch(`/api/tasks/${taskId}`);
+    if (!resp.ok) return;
+    const task = await resp.json();
+    const stats = task.stats || {};
+    const result = task.result || {};
+
+    document.getElementById('modal-title').textContent = `任务 ${task.query || taskId}`;
+
+    const box = document.getElementById('modal-body');
+    box.innerHTML = '';
+
+    // 汇总
+    const summary = document.createElement('div');
+    summary.className = 'task-summary';
+    const lines = [
+        ['关键词', task.query || '—'],
+        ['时间', `${(task.started_at || '').slice(0, 19)} → ${(task.finished_at || '').slice(0, 19) || '—'}`],
+        ['状态', task.status],
+        ['搜索页数 / 抓取目标', `${stats.search_pages || 0} / ${stats.detail_total || 0}`],
+        ['成功 / 失败 / 风控',
+         `${stats.detail_success || 0} / ${stats.detail_failed || 0} / ${stats.risk_hits || 0}`],
+        ['入库结果', `新增 ${result.new_saved || 0} 篇 · 已存在 ${result.already_exists || 0} 篇`
+            + (result.dup_titles ? ` · 重复标题 ${result.dup_titles} 篇` : '')
+            + ` · TXT ${result.txt_saved || 0}`],
+    ];
+    lines.forEach(([k, v]) => {
+        const p = document.createElement('p');
+        const strong = document.createElement('strong');
+        strong.textContent = k + '：';
+        p.appendChild(strong);
+        p.appendChild(document.createTextNode(v));
+        summary.appendChild(p);
+    });
+    box.appendChild(summary);
+
+    // 日志
+    const steps = task.steps || [];
+    if (steps.length) {
+        const title = document.createElement('div');
+        title.className = 'log-title';
+        title.innerHTML = `<svg class="icon"><use href="#i-terminal"/></svg>`;
+        title.appendChild(document.createTextNode(`完整请求日志 · ${steps.length} 条`));
+        box.appendChild(title);
+
+        const list = document.createElement('div');
+        list.className = 'requests-list';
+        steps.forEach(step => {
+            const row = document.createElement('div');
+            row.className = `req-row req-${step.status || 'info'}`;
+            row.innerHTML =
+                `<span class="req-phase">${step.phase || '—'}</span>` +
+                `<span class="req-status"><svg class="icon"><use href="${STATUS_ICON[step.status] || '#i-info'}"/></svg></span>` +
+                `<span class="req-msg">${esc(step.message)}</span>`;
+            list.appendChild(row);
+        });
+        box.appendChild(list);
+    }
+
+    document.getElementById('task-modal').classList.remove('hidden');
+}
+
+function closeModal() {
+    document.getElementById('task-modal').classList.add('hidden');
+}
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeModal();
+});
+
+async function deleteTask(taskId) {
+    if (!confirm('确定删除此任务记录？')) return;
+    await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+    location.reload();
+}
+
+async function clearAll() {
+    if (!confirm('确定清空全部历史日志？此操作不可恢复。')) return;
+    await fetch('/api/tasks', { method: 'DELETE' });
+    location.reload();
+}
+</script>
+{% endblock %}

@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Cookie 配置 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">Cookie 配置</h1>
+        <p class="page-sub">配置牛客登录态可绕过部分风控 · 数据存于本地 <code>data/cookies.json</code></p>
+    </div>
+</div>
+
+<!-- 当前状态 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-cookie"/></svg>当前状态</div>
+        <button class="btn btn-sm btn-ghost" onclick="refreshStatus()">
+            <svg class="icon"><use href="#i-refresh"/></svg><span>刷新</span>
+        </button>
+    </div>
+
+    {% if cookie_status.configured %}
+    <div class="status-ok">
+        <span class="status-dot ok"></span>
+        <strong>已配置</strong>
+        <span>{{ cookie_status.count }} 个 Cookie</span>
+        {% if cookie_status.updated_at %}
+        <span>更新于 {{ cookie_status.updated_at[:19] }}</span>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="status-warn">
+        <span class="status-dot warn"></span>
+        <strong>未配置 Cookie</strong>
+        <span>爬虫将以游客身份请求，容易触发限流</span>
+    </div>
+    {% endif %}
+
+    {% if cookie_status.cookies %}
+    <details class="cookie-details">
+        <summary><svg class="icon"><use href="#i-eye"/></svg>查看 Cookie 明细（已脱敏）</summary>
+        <div class="table-wrap" style="margin-top:10px;">
+            <table class="data-table">
+                <thead><tr><th style="width:240px;">Name</th><th>Value</th></tr></thead>
+                <tbody>
+                    {% for name, masked_value in cookie_status.cookies.items() %}
+                    <tr>
+                        <td><code style="color:var(--ac);">{{ name }}</code></td>
+                        <td><code class="masked">{{ masked_value }}</code></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </details>
+    {% endif %}
+</div>
+
+<!-- 更新 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-save"/></svg>更新 Cookie</div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="string" onclick="switchTab('string')">粘贴字符串</button>
+        <button class="tab-btn" data-tab="pair" onclick="switchTab('pair')">Key-Value 对</button>
+    </div>
+
+    <div id="tab-string" class="tab-content">
+        <p class="hint">
+            浏览器打开 <a href="https://www.nowcoder.com" target="_blank" rel="noopener">牛客网</a> 并登录
+            → F12 → Application → Cookies → 复制为
+            <code>name=value; name2=value2</code> 格式后粘贴到下方。
+        </p>
+        <textarea id="cookie-string" rows="8"
+                  placeholder="NOWCODER_USERID=123456789; NOWCODER_USERNAME=xxx; NOWCODER_TOKEN=abc123..."></textarea>
+        <div class="form-actions" style="margin-top:12px;">
+            <button class="btn btn-primary" onclick="updateCookie('string')">
+                <svg class="icon"><use href="#i-save"/></svg><span>保存</span>
+            </button>
+        </div>
+    </div>
+
+    <div id="tab-pair" class="tab-content hidden">
+        <p class="hint">逐条填写 Cookie 名称与值，适合只想要其中几个字段的情况。</p>
+        <div id="cookie-pairs">
+            <div class="kv-row">
+                <input type="text" class="kv-key" placeholder="Cookie 名，如 NOWCODER_USERID">
+                <input type="text" class="kv-value" placeholder="Cookie 值">
+                <button class="btn btn-sm btn-danger btn-icon" onclick="removeKv(this)" title="删除此行">
+                    <svg class="icon"><use href="#i-x"/></svg>
+                </button>
+            </div>
+        </div>
+        <div class="form-actions" style="margin-top:12px;">
+            <button class="btn btn-ghost" onclick="addKv()">
+                <svg class="icon"><use href="#i-plus"/></svg><span>添加一行</span>
+            </button>
+            <button class="btn btn-primary" onclick="updateCookie('pair')">
+                <svg class="icon"><use href="#i-save"/></svg><span>保存</span>
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="form-actions">
+        <button class="btn btn-danger" onclick="clearCookie()">
+            <svg class="icon"><use href="#i-trash"/></svg><span>清除全部 Cookie</span>
+        </button>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    document.querySelector(`.tab-btn[data-tab="${name}"]`).classList.add('active');
+    document.getElementById('tab-' + name).classList.remove('hidden');
+}
+
+function addKv() {
+    const row = document.createElement('div');
+    row.className = 'kv-row';
+    const key = document.createElement('input');
+    key.type = 'text';
+    key.className = 'kv-key';
+    key.placeholder = 'Cookie 名';
+    const val = document.createElement('input');
+    val.type = 'text';
+    val.className = 'kv-value';
+    val.placeholder = 'Cookie 值';
+    const del = document.createElement('button');
+    del.className = 'btn btn-sm btn-danger btn-icon';
+    del.title = '删除此行';
+    del.innerHTML = '<svg class="icon"><use href="#i-x"/></svg>';
+    del.onclick = () => removeKv(del);
+    row.append(key, val, del);
+    document.getElementById('cookie-pairs').appendChild(row);
+}
+
+function removeKv(btn) {
+    const rows = document.querySelectorAll('#cookie-pairs .kv-row');
+    if (rows.length > 1) btn.closest('.kv-row').remove();
+}
+
+async function updateCookie(mode) {
+    let body = {};
+    if (mode === 'string') {
+        const val = document.getElementById('cookie-string').value.trim();
+        if (!val) { showFeed('请输入 Cookie 字符串', 'error'); return; }
+        body = { cookie_string: val };
+    } else {
+        const cookies = {};
+        document.querySelectorAll('#cookie-pairs .kv-row').forEach(row => {
+            const k = row.querySelector('.kv-key').value.trim();
+            const v = row.querySelector('.kv-value').value.trim();
+            if (k) cookies[k] = v;
+        });
+        if (!Object.keys(cookies).length) { showFeed('请至少填写一对 Cookie', 'error'); return; }
+        body = { cookies: cookies };
+    }
+
+    showFeed('保存中…', 'info');
+    try {
+        const resp = await fetch('/api/cookie', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            showFeed(data.message + '，下次爬取自动生效', 'success');
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            showFeed('保存失败：' + (data.detail || '未知错误'), 'error');
+        }
+    } catch (e) {
+        showFeed('网络错误：' + e.message, 'error');
+    }
+}
+
+async function clearCookie() {
+    if (!confirm('确定清除已保存的 Cookie？')) return;
+    await fetch('/api/cookie', { method: 'DELETE' });
+    showFeed('Cookie 已清除', 'success');
+    setTimeout(() => location.reload(), 800);
+}
+
+async function refreshStatus() {
+    const resp = await fetch('/api/cookie');
+    const data = await resp.json();
+    if (data.configured) showFeed(`当前已配置 ${data.count} 个 Cookie`, 'success');
+    else showFeed('尚未配置 Cookie', 'info');
+}
+
+let _feedEl = null;
+let _feedTimer = null;
+function showFeed(msg, type) {
+    if (!_feedEl) {
+        _feedEl = document.createElement('div');
+        document.body.appendChild(_feedEl);
+    }
+    const icon = type === 'success' ? '#i-check' : type === 'error' ? '#i-x-circle' : '#i-info';
+    _feedEl.className = 'feedback feedback-' + (type || 'info');
+    _feedEl.innerHTML = `<svg class="icon"><use href="${icon}"/></svg><span></span>`;
+    _feedEl.querySelector('span').textContent = msg;
+    clearTimeout(_feedTimer);
+    _feedTimer = setTimeout(() => _feedEl.classList.add('hidden'), 3500);
+}
+</script>
+{% endblock %}
