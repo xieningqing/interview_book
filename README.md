@@ -49,11 +49,11 @@ interview_book/
 │   ├── storage/            # database / cookie / proxy / txt 存储
 │   ├── templates/          # Jinja2 页面
 │   └── static/style.css    # 全站样式
-└── data/                   # 运行后生成（含敏感数据，已在 .gitignore）
-    ├── cookies.json
-    ├── proxies.json
-    ├── interview.db
-    └── txt/
+└── data/
+    ├── interview.db        # 仓库中为仅含表结构的初始化空库；本地运行数据不提交
+    ├── cookies.json        # 运行时生成，不提交
+    ├── proxies.json        # 运行时生成，不提交
+    └── txt/                # TXT 导出，不提交
 ```
 
 ## 说明
