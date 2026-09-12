@@ -6,7 +6,6 @@
 <div class="page-head">
     <div>
         <h1 class="page-title">Cookie 配置</h1>
-        <p class="page-sub">配置牛客登录态可绕过部分风控 · 数据存于本地 <code>data/cookies.json</code></p>
     </div>
 </div>
 
@@ -185,7 +184,12 @@ async function updateCookie(mode) {
 }
 
 async function clearCookie() {
-    if (!confirm('确定清除已保存的 Cookie？')) return;
+    const go = await uiConfirm({
+        title: '清除 Cookie',
+        message: '确定清除已保存的 Cookie？清除后需要重新配置才能继续爬取。',
+        okText: '清除', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch('/api/cookie', { method: 'DELETE' });
     showFeed('Cookie 已清除', 'success');
     setTimeout(() => location.reload(), 800);

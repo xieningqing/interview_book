@@ -10,6 +10,7 @@
 - **爬取监控**：实时阶段流转、进度条、成功/失败/风控统计与请求日志
 - **Cookie 管理**：粘贴浏览器 Cookie 即可，支持脱敏查看
 - **IP 代理池**：支持 http / https / socks5，轮询/随机/固定策略，任务内会话粘性
+- **AI 数据清洗**：接入 OpenAI 兼容大模型（DeepSeek/通义/Kimi/智谱/自建 vLLM 等），把松散正文重排为结构化 Q&A、问题去重归并、答案完整保留；自动识别与关键词不相关的面经并标记隐藏（可恢复，不删除），支持按关键词批量清洗、单篇清洗、任务停止
 - **反爬策略**：UA 轮换、随机延迟、指数退避重试、风控检测、SEO 降级页识别重试
 
 ## 技术栈
@@ -35,6 +36,7 @@ python run.py
 3. 点击 **爬取**，在进度面板实时观察；需要中断时点 **停止**，已抓到的面经会保留
 4. 到 **面经库** 浏览、筛选、查看详情；TXT 同时保存在 `data/txt/关键词/` 目录
 5. 高频抓取建议在 **代理** 页配置代理池，降低风控概率
+6. 在 **数据清洗** 页填好 OpenAI 兼容的大模型接口（base_url / Key / 模型）并测试通过，选择关键词即可批量清洗；也可在某篇详情页单独点「AI 清洗」
 
 ## 目录结构
 
@@ -46,13 +48,15 @@ interview_book/
 │   ├── main.py             # FastAPI 路由与任务调度
 │   ├── config.py           # 爬虫参数 / UA 池 / 阈值配置
 │   ├── crawler/nowcoder.py # 牛客搜索、详情抓取、反爬逻辑
-│   ├── storage/            # database / cookie / proxy / txt 存储
+│   ├── ai/                 # 大模型客户端与面经清洗（llm / cleaner）
+│   ├── storage/            # database / cookie / proxy / llm_config / txt 存储
 │   ├── templates/          # Jinja2 页面
 │   └── static/style.css    # 全站样式
 └── data/
     ├── interview.db        # 仓库中为仅含表结构的初始化空库；本地运行数据不提交
     ├── cookies.json        # 运行时生成，不提交
     ├── proxies.json        # 运行时生成，不提交
+    ├── llm_config.json     # 大模型配置（含 Key），不提交
     └── txt/                # TXT 导出，不提交
 ```
 

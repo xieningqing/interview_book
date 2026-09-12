@@ -7,11 +7,14 @@
     <div>
         <h1 class="page-title">面经库</h1>
         <p class="page-sub">
-            共 {{ interviews|length }} 篇
+            共 {{ total }} 篇
             {% if selected_keyword %}· 当前筛选「{{ selected_keyword.name }}」{% endif %}
         </p>
     </div>
 </div>
+
+{# 分页链接前缀：切换页码时保留当前关键词筛选 #}
+{% set pager_base %}/interviews?{% if selected_keyword %}keyword_id={{ selected_keyword.id }}&{% endif %}page={% endset %}
 
 <div class="card filter-card">
     <form method="get" action="/interviews" class="filter-form">
@@ -42,7 +45,23 @@
             <span><svg class="icon"><use href="#i-user"/></svg>{{ inv.author }}</span>
             {% endif %}
         </div>
-        <div class="inv-title">{{ inv.title }}</div>
+        <div class="inv-title-row">
+            <div class="inv-title">{{ inv.title }}</div>
+            {% if inv.cleaned_at or inv.answered_at %}
+            <div class="inv-badges">
+                {% if inv.cleaned_at and not inv.is_irrelevant %}
+                <span class="clean-badge" title="AI 已于 {{ inv.cleaned_at[:16]|replace('T',' ') }} 清洗">
+                    <svg class="icon"><use href="#i-wand"/></svg>已清洗
+                </span>
+                {% endif %}
+                {% if inv.answered_at and not inv.is_irrelevant %}
+                <span class="answer-badge" title="AI 已于 {{ inv.answered_at[:16]|replace('T',' ') }} 生成参考答案，批量答题自动跳过">
+                    <svg class="icon"><use href="#i-book"/></svg>已答题
+                </span>
+                {% endif %}
+            </div>
+            {% endif %}
+        </div>
         {% if inv.school or inv.position or inv.tags %}
         <div class="inv-info">
             {% if inv.school %}<span class="tag">{{ inv.school }}</span>{% endif %}
@@ -61,6 +80,37 @@
     </a>
     {% endfor %}
 </div>
+
+{% if total_pages > 1 %}
+<nav class="pagination" aria-label="面经分页">
+    <span class="pagination-info">
+        第 {{ (page - 1) * page_size + 1 }}–{{ [page * page_size, total]|min }} 条 · 共 {{ total }} 条
+    </span>
+    <div class="pagination-pages">
+        {% if page > 1 %}
+        <a class="page-btn" href="{{ pager_base }}{{ page - 1 }}" aria-label="上一页"><svg class="icon"><use href="#i-chev-left"/></svg></a>
+        {% else %}
+        <span class="page-btn disabled" aria-hidden="true"><svg class="icon"><use href="#i-chev-left"/></svg></span>
+        {% endif %}
+
+        {% for p in page_items %}
+            {% if p is none %}
+            <span class="page-gap">…</span>
+            {% elif p == page %}
+            <span class="page-btn active">{{ p }}</span>
+            {% else %}
+            <a class="page-btn" href="{{ pager_base }}{{ p }}">{{ p }}</a>
+            {% endif %}
+        {% endfor %}
+
+        {% if page < total_pages %}
+        <a class="page-btn" href="{{ pager_base }}{{ page + 1 }}" aria-label="下一页"><svg class="icon"><use href="#i-chev-right"/></svg></a>
+        {% else %}
+        <span class="page-btn disabled" aria-hidden="true"><svg class="icon"><use href="#i-chev-right"/></svg></span>
+        {% endif %}
+    </div>
+</nav>
+{% endif %}
 {% else %}
 <div class="empty">
     <div class="empty-badge">

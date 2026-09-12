@@ -1,0 +1,545 @@
+{% extends "base.html" %}
+{% block title %}数据清洗 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">数据清洗</h1>
+    </div>
+</div>
+
+<!-- 清洗概况 -->
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="stat-icon tone-blue"><svg class="icon"><use href="#i-file"/></svg></div>
+        <div class="stat-info"><div class="stat-value">{{ clean_stats.total }}</div><div class="stat-label">面经总数</div></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-green"><svg class="icon"><use href="#i-check"/></svg></div>
+        <div class="stat-info"><div class="stat-value">{{ clean_stats.cleaned }}</div><div class="stat-label">已清洗</div></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-blue"><svg class="icon"><use href="#i-book"/></svg></div>
+        <div class="stat-info"><div class="stat-value">{{ clean_stats.answered }}</div><div class="stat-label">已生成 AI 答案</div></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-amber"><svg class="icon"><use href="#i-alert"/></svg></div>
+        <div class="stat-info"><div class="stat-value">{{ clean_stats.irrelevant }}</div><div class="stat-label">已归档（不相关）</div></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon tone-purple"><svg class="icon"><use href="#i-wand"/></svg></div>
+        <div class="stat-info"><div class="stat-value">{{ clean_stats.pending }}</div><div class="stat-label">待清洗</div></div>
+    </div>
+</div>
+
+<!-- 大模型配置（点击头部展开） -->
+<div class="card">
+    <div class="card-head collapsible-head" id="llm-head" role="button" tabindex="0"
+         aria-expanded="false" title="点击配置大模型接口">
+        <div class="card-title"><svg class="icon"><use href="#i-terminal"/></svg>大模型接口（OpenAI 兼容）</div>
+        <span class="collapsible-toggle">
+            <span class="card-note" id="llm-state-note">
+                {% if llm_status.configured %}<span class="dot-ok"></span>已配置 · {{ llm_status.model }}{% else %}<span class="dot-off"></span>尚未配置{% endif %}
+            </span>
+            <span class="btn btn-sm btn-ghost" id="llm-toggle-btn">
+                <span id="llm-toggle-text">设置</span>
+                <svg class="icon chev"><use href="#i-chev-down"/></svg>
+            </span>
+        </span>
+    </div>
+    <div id="llm-body" style="display:none;">
+    <div class="vendor-row">
+        <span class="vendor-label">快速选择服务商：</span>
+        <div class="vendor-chips" id="vendor-chips"></div>
+    </div>
+    <form id="llm-form" class="form-inline" style="align-items:flex-end;">
+        <div class="form-group grow">
+            <label for="llm-base-url">Base URL</label>
+            <input type="text" id="llm-base-url" placeholder="点上方服务商自动填入，或手动填写"
+                   value="{{ llm_status.base_url }}" autocomplete="off">
+        </div>
+        <div class="form-group grow">
+            <label for="llm-model">模型名</label>
+            <input type="text" id="llm-model" list="llm-model-list"
+                   placeholder="点击右侧箭头选择，或手动输入"
+                   value="{{ llm_status.model }}" autocomplete="off">
+            <datalist id="llm-model-list"></datalist>
+        </div>
+        <div class="form-group grow">
+            <label for="llm-key">API Key {% if llm_status.api_key_masked %}<span class="unit">（已保存 {{ llm_status.api_key_masked }}，留空不修改）</span>{% endif %}</label>
+            <input type="password" id="llm-key" placeholder="{% if llm_status.api_key_masked %}留空保持不变{% else %}sk-...{% endif %}">
+        </div>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-ghost">
+                <svg class="icon"><use href="#i-save"/></svg><span>保存配置</span>
+            </button>
+            <button type="button" id="llm-test-btn" class="btn btn-primary">
+                <svg class="icon"><use href="#i-zap"/></svg><span>测试连接</span>
+            </button>
+        </div>
+    </form>
+    <p class="hint" style="margin-bottom:0;margin-top:10px;">
+        点上方服务商可自动填入接口地址；模型名请自行从下拉选择或手动填写（也兼容 vLLM / Ollama / 网关等任何 OpenAI 格式端点）。
+        API Key 仅保存在本机，不会上传。
+    </p>
+    </div>
+</div>
+
+<!-- 发起清洗 -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-wand"/></svg>批量清洗</div>
+        <span class="card-note">只处理未清洗的增量；整篇无关联才归档（可在导航「数据清洗 → 清洗归档」中恢复）</span>
+    </div>
+    <div class="filter-bar">
+        <div class="form-group" style="min-width:240px;">
+            <label for="clean-keyword">选择关键词</label>
+            <select id="clean-keyword">
+                <option value="">— 请选择关键词 —</option>
+                {% for kw in keywords %}
+                <option value="{{ kw.id }}">{{ kw.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-actions">
+            <button type="button" id="clean-start-btn" class="btn btn-primary">
+                <svg class="icon"><use href="#i-wand"/></svg><span>开始清洗</span>
+            </button>
+            <button type="button" id="clean-stop-btn" class="btn btn-danger" style="display:none;">
+                <svg class="icon"><use href="#i-stop"/></svg><span>停止</span>
+            </button>
+        </div>
+    </div>
+
+    <div id="clean-panel" class="clean-panel" style="display:none;margin-top:16px;">
+        <div class="progress-main">
+            <div class="progress-bar-container"><div id="clean-bar" class="progress-bar"></div></div>
+            <div class="progress-text" id="clean-text">准备中…</div>
+        </div>
+        <div class="stats-grid">
+            <div class="mini-stat"><span class="mini-num" id="c-total">0</span><span class="mini-label">待处理</span></div>
+            <div class="mini-stat stat-success"><span class="mini-num" id="c-cleaned">0</span><span class="mini-label"><svg class="icon"><use href="#i-check"/></svg>已清洗</span></div>
+            <div class="mini-stat stat-skip"><span class="mini-num" id="c-irrel">0</span><span class="mini-label"><svg class="icon"><use href="#i-alert"/></svg>不相关</span></div>
+            <div class="mini-stat stat-fail"><span class="mini-num" id="c-failed">0</span><span class="mini-label"><svg class="icon"><use href="#i-x-circle"/></svg>失败</span></div>
+        </div>
+        <details class="requests-details" open>
+            <summary><svg class="icon"><use href="#i-terminal"/></svg>清洗日志</summary>
+            <div id="clean-log" class="requests-list"></div>
+        </details>
+    </div>
+</div>
+
+<!-- AI 答题（清洗之后的第二道链路） -->
+<div class="card">
+    <div class="card-head">
+        <div class="card-title"><svg class="icon"><use href="#i-book"/></svg>批量 AI 答题</div>
+        <span class="card-note">仅处理已清洗的面经，已答题的自动跳过；每题生成简洁贴切的参考答案，原回答保留作参照</span>
+    </div>
+    <div class="filter-bar">
+        <div class="form-group" style="min-width:240px;">
+            <label for="answer-keyword">选择关键词</label>
+            <select id="answer-keyword">
+                <option value="">— 请选择关键词 —</option>
+                {% for kw in keywords %}
+                <option value="{{ kw.id }}">{{ kw.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-actions">
+            <button type="button" id="answer-start-btn" class="btn btn-primary">
+                <svg class="icon"><use href="#i-book"/></svg><span>开始答题</span>
+            </button>
+            <button type="button" id="answer-stop-btn" class="btn btn-danger" style="display:none;">
+                <svg class="icon"><use href="#i-stop"/></svg><span>停止</span>
+            </button>
+        </div>
+    </div>
+
+    <div id="answer-panel" class="clean-panel" style="display:none;margin-top:16px;">
+        <div class="progress-main">
+            <div class="progress-bar-container"><div id="answer-bar" class="progress-bar"></div></div>
+            <div class="progress-text" id="answer-text">准备中…</div>
+        </div>
+        <div class="stats-grid">
+            <div class="mini-stat"><span class="mini-num" id="a-total">0</span><span class="mini-label">待处理</span></div>
+            <div class="mini-stat stat-success"><span class="mini-num" id="a-done">0</span><span class="mini-label"><svg class="icon"><use href="#i-check"/></svg>已答题</span></div>
+            <div class="mini-stat"><span class="mini-num" id="a-questions">0</span><span class="mini-label"><svg class="icon"><use href="#i-help"/></svg>生成答案</span></div>
+            <div class="mini-stat stat-fail"><span class="mini-num" id="a-failed">0</span><span class="mini-label"><svg class="icon"><use href="#i-x-circle"/></svg>失败</span></div>
+        </div>
+        <details class="requests-details" open>
+            <summary><svg class="icon"><use href="#i-terminal"/></svg>答题日志</summary>
+            <div id="answer-log" class="requests-list"></div>
+        </details>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function svg(h){ return `<svg class="icon"><use href="${h}"/></svg>`; }
+let cleanTaskId = null, cleanTimer = null, cleanLast = 0;
+const LLM_CONFIGURED = {{ 'true' if llm_status.configured else 'false' }};
+
+// ===== 服务商预设（base_url 为 OpenAI 兼容端点）=====
+const VENDORS = [
+    {id:'deepseek', name:'DeepSeek', base:'https://api.deepseek.com/v1', models:[
+        {v:'deepseek-chat', label:'DeepSeek-V3 · 通用对话'},
+        {v:'deepseek-reasoner', label:'DeepSeek-R1 · 深度推理'},
+    ]},
+    {id:'qwen', name:'通义千问', base:'https://dashscope.aliyuncs.com/compatible-mode/v1', models:[
+        {v:'qwen-plus', label:'通义 · 均衡（推荐）'},
+        {v:'qwen-turbo', label:'通义 · 快速便宜'},
+        {v:'qwen-max', label:'通义 · 旗舰'},
+        {v:'qwen-long', label:'通义 · 长文本'},
+    ]},
+    {id:'moonshot', name:'Kimi', base:'https://api.moonshot.cn/v1', models:[
+        {v:'moonshot-v1-8k', label:'Kimi · 8k 上下文'},
+        {v:'moonshot-v1-32k', label:'Kimi · 32k 上下文'},
+        {v:'moonshot-v1-128k', label:'Kimi · 128k 上下文'},
+    ]},
+    {id:'zhipu', name:'智谱 GLM', base:'https://open.bigmodel.cn/api/paas/v4', models:[
+        {v:'glm-4-flash', label:'GLM-4-Flash · 免费'},
+        {v:'glm-4', label:'GLM-4 · 通用'},
+        {v:'glm-4-plus', label:'GLM-4-Plus · 旗舰'},
+        {v:'glm-4-long', label:'GLM-4 · 长文本'},
+    ]},
+    {id:'openai', name:'OpenAI', base:'https://api.openai.com/v1', models:[
+        {v:'gpt-4o-mini', label:'GPT-4o mini · 便宜'},
+        {v:'gpt-4o', label:'GPT-4o · 通用'},
+        {v:'gpt-4.1-mini', label:'GPT-4.1 mini'},
+    ]},
+    {id:'ollama', name:'Ollama 本地', base:'http://localhost:11434/v1', models:[
+        {v:'qwen2.5:7b', label:'Qwen2.5 7B'},
+        {v:'llama3.1:8b', label:'Llama 3.1 8B'},
+        {v:'deepseek-r1:7b', label:'DeepSeek-R1 7B'},
+    ], note:'本地模型名以 `ollama list` 实际安装为准'},
+];
+
+const chipsBox = document.getElementById('vendor-chips');
+const modelList = document.getElementById('llm-model-list');
+const baseInput = document.getElementById('llm-base-url');
+const modelInput = document.getElementById('llm-model');
+
+function fillModelOptions(models) {
+    modelList.innerHTML = '';
+    (models || []).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.v;
+        opt.label = m.label || '';
+        modelList.appendChild(opt);
+    });
+}
+function setActiveChip(id) {
+    chipsBox.querySelectorAll('.vendor-chip').forEach(c =>
+        c.classList.toggle('active', c.dataset.vendor === id));
+}
+chipsBox.innerHTML = VENDORS.map(v =>
+    `<button type="button" class="vendor-chip" data-vendor="${v.id}">${v.name}</button>`
+).join('');
+chipsBox.addEventListener('click', (e) => {
+    const chip = e.target.closest('.vendor-chip');
+    if (!chip) return;
+    const v = VENDORS.find(x => x.id === chip.dataset.vendor);
+    baseInput.value = v.base;
+    fillModelOptions(v.models);
+    // 模型名不自动填、不覆盖已保存值，由用户自行从下拉选择或手动输入
+    setActiveChip(v.id);
+    if (v.note) showFeed(v.note, 'info');
+    modelInput.focus();
+});
+// 手动改 Base URL 时取消服务商高亮，避免误认；模型名始终可自由输入
+baseInput.addEventListener('input', () => setActiveChip(null));
+// 初始不预置模型，用户先选服务商看可选模型，或直接手动输入
+fillModelOptions([]);
+
+// ===== 配置折叠面板 =====
+const llmHead = document.getElementById('llm-head');
+const llmBody = document.getElementById('llm-body');
+const llmToggleText = document.getElementById('llm-toggle-text');
+
+function setLlmOpen(open) {
+    llmBody.style.display = open ? '' : 'none';
+    llmHead.classList.toggle('open', open);
+    llmHead.setAttribute('aria-expanded', open ? 'true' : 'false');
+    llmToggleText.textContent = open ? '收起' : (LLM_CONFIGURED ? '修改' : '设置');
+}
+llmHead.addEventListener('click', () => setLlmOpen(llmBody.style.display === 'none'));
+llmHead.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); llmHead.click(); }
+});
+setLlmOpen(false);
+
+// 未配置时引导展开配置并定位
+async function promptConfig() {
+    const go = await uiConfirm({
+        title: '需要先配置大模型',
+        message: '尚未配置大模型接口，暂时无法清洗。\n是否现在去配置？（配置只需填一次）',
+        okText: '去配置', cancelText: '取消', iconHref: '#i-wand',
+    });
+    if (go) {
+        setLlmOpen(true);
+        llmHead.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => document.getElementById('llm-base-url').focus(), 300);
+    }
+    return go;
+}
+
+let _feedEl = null, _feedTimer = null;
+function showFeed(msg, type) {
+    if (!_feedEl) { _feedEl = document.createElement('div'); _feedEl.id = 'page-feedback'; document.body.appendChild(_feedEl); }
+    const icon = type === 'success' ? '#i-check' : type === 'error' ? '#i-x-circle' : '#i-info';
+    _feedEl.className = 'feedback feedback-' + (type || 'info');
+    _feedEl.innerHTML = svg(icon) + '<span></span>';
+    _feedEl.querySelector('span').textContent = msg;
+    clearTimeout(_feedTimer);
+    _feedTimer = setTimeout(() => _feedEl.classList.add('hidden'), 4000);
+}
+
+// ===== LLM 配置 =====
+document.getElementById('llm-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const body = {
+        base_url: document.getElementById('llm-base-url').value.trim(),
+        model: document.getElementById('llm-model').value.trim(),
+    };
+    const key = document.getElementById('llm-key').value.trim();
+    if (key) body.api_key = key;
+    const r = await fetch('/api/llm/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) { showFeed(d.detail || '保存失败', 'error'); return; }
+    showFeed('大模型配置已保存', 'success');
+    setTimeout(() => location.reload(), 1200);
+});
+
+document.getElementById('llm-test-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('llm-test-btn');
+    btn.disabled = true; btn.querySelector('span').textContent = '测试中…';
+    try {
+        const r = await fetch('/api/llm/test', {method:'POST'});
+        const d = await r.json();
+        showFeed(d.message, d.ok ? 'success' : 'error');
+    } catch(e) { showFeed('测试失败：' + e.message, 'error'); }
+    btn.disabled = false; btn.querySelector('span').textContent = '测试连接';
+});
+
+// ===== 批量清洗 =====
+document.getElementById('clean-start-btn').addEventListener('click', async () => {
+    if (!LLM_CONFIGURED) { promptConfig(); return; }
+    const kid = document.getElementById('clean-keyword').value;
+    if (!kid) { showFeed('请先选择关键词', 'error'); return; }
+    const go = await uiConfirm({
+        title: '开始批量清洗',
+        message: '将只清洗该关键词下尚未处理的面经（已清洗/已标记的会自动跳过）。\n仅当整篇与关键词几乎无关时才标记隐藏（可恢复）；相关面经的所有问答都会保留并整理为结构化格式。',
+        okText: '开始清洗', iconHref: '#i-wand',
+    });
+    if (!go) return;
+
+    const panel = document.getElementById('clean-panel');
+    panel.style.display = '';
+    ['c-total','c-cleaned','c-irrel','c-failed'].forEach(id => document.getElementById(id).textContent = '0');
+    document.getElementById('clean-log').innerHTML = '';
+    document.getElementById('clean-bar').style.width = '0%';
+    cleanLast = 0;
+
+    const r = await fetch('/api/clean', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({keyword_id: parseInt(kid, 10)})});
+    const d = await r.json();
+    if (!r.ok) {
+        panel.style.display = 'none';
+        if (r.status === 400 && /大模型|配置/.test(d.detail || '')) { promptConfig(); }
+        else { showFeed(d.detail || '启动失败', 'error'); }
+        return;
+    }
+    cleanTaskId = d.task_id;
+    document.getElementById('clean-start-btn').style.display = 'none';
+    document.getElementById('clean-stop-btn').style.display = '';
+    if (cleanTimer) clearInterval(cleanTimer);
+    cleanTimer = setInterval(pollClean, 800);
+});
+
+document.getElementById('clean-stop-btn').addEventListener('click', async () => {
+    if (!cleanTaskId) return;
+    const go = await uiConfirm({
+        title: '停止清洗',
+        message: '确定停止当前清洗任务？已处理的结果会保留。',
+        okText: '停止', danger: true, iconHref: '#i-stop',
+    });
+    if (!go) return;
+    await fetch(`/api/clean/${cleanTaskId}/stop`, {method:'POST'});
+    showFeed('正在停止…', 'info');
+});
+
+const STATUS_ICON = {success:'#i-check', failed:'#i-x-circle', skipped:'#i-alert'};
+function renderCleanSteps(steps) {
+    const list = document.getElementById('clean-log');
+    const frag = document.createDocumentFragment();
+    steps.forEach(s => {
+        const row = document.createElement('div');
+        row.className = `req-row req-${s.status || 'info'}`;
+        const ph = document.createElement('span'); ph.className = 'req-phase';
+        ph.innerHTML = svg('#i-wand') + '清洗';
+        const st = document.createElement('span'); st.className = 'req-status';
+        st.innerHTML = svg(STATUS_ICON[s.status] || '#i-info');
+        const msg = document.createElement('span'); msg.className = 'req-msg'; msg.textContent = s.message || '';
+        row.append(ph, st, msg); frag.appendChild(row);
+    });
+    list.appendChild(frag);
+    list.scrollTop = list.scrollHeight;
+}
+
+function finishClean(fullBar) {
+    if (cleanTimer) { clearInterval(cleanTimer); cleanTimer = null; }
+    cleanTaskId = null;
+    if (fullBar) document.getElementById('clean-bar').style.width = '100%';
+    document.getElementById('clean-start-btn').style.display = '';
+    document.getElementById('clean-stop-btn').style.display = 'none';
+}
+
+function pollClean() {
+    if (!cleanTaskId) return;
+    fetch(`/api/clean/${cleanTaskId}/progress`).then(async r => {
+        if (!r.ok) {
+            // 任务不存在（如服务重启）：停止轮询，避免无限空转
+            finishClean(false);
+            showFeed('任务已失效（可能服务已重启）', 'error');
+            return null;
+        }
+        return r.json();
+    }).then(data => {
+        if (!data) return;
+        const s = data.stats || {};
+        document.getElementById('c-total').textContent = s.total || 0;
+        document.getElementById('c-cleaned').textContent = s.cleaned || 0;
+        document.getElementById('c-irrel').textContent = s.irrelevant || 0;
+        document.getElementById('c-failed').textContent = s.failed || 0;
+        const steps = data.steps || [];
+        if (steps.length > cleanLast) { renderCleanSteps(steps.slice(cleanLast)); cleanLast = steps.length; }
+
+        const latest = steps[steps.length - 1];
+        const pct = s.total ? Math.round(((s.cleaned||0)+(s.irrelevant||0)+(s.failed||0)) / s.total * 100) : 0;
+        document.getElementById('clean-bar').style.width = pct + '%';
+        document.getElementById('clean-text').textContent =
+            latest ? latest.message : '准备中…';
+
+        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed') {
+            finishClean('ok');
+            const ok = data.status === 'done';
+            showFeed(ok ? '清洗完成' : (data.status === 'stopped' ? '清洗已停止' : '清洗失败'),
+                     ok ? 'success' : (data.status === 'stopped' ? 'info' : 'error'));
+            if (ok) setTimeout(() => location.reload(), 2000);
+        }
+    }).catch(() => {});
+}
+
+// ===== 批量 AI 答题 =====
+let answerTaskId = null, answerTimer = null, answerLast = 0;
+
+document.getElementById('answer-start-btn').addEventListener('click', async () => {
+    if (!LLM_CONFIGURED) { promptConfig(); return; }
+    const kid = document.getElementById('answer-keyword').value;
+    if (!kid) { showFeed('请先选择关键词', 'error'); return; }
+    const go = await uiConfirm({
+        title: '开始批量 AI 答题',
+        message: '将为该关键词下已清洗、尚未答题的面经逐篇生成参考答案。\n答案要求简洁贴切；面经当事人的原回答会原样保留，可在详情页上下对照。',
+        okText: '开始答题', iconHref: '#i-book',
+    });
+    if (!go) return;
+
+    const panel = document.getElementById('answer-panel');
+    panel.style.display = '';
+    ['a-total','a-done','a-questions','a-failed'].forEach(id => document.getElementById(id).textContent = '0');
+    document.getElementById('answer-log').innerHTML = '';
+    document.getElementById('answer-bar').style.width = '0%';
+    answerLast = 0;
+
+    const r = await fetch('/api/answer', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({keyword_id: parseInt(kid, 10)})});
+    const d = await r.json();
+    if (!r.ok) {
+        panel.style.display = 'none';
+        if (r.status === 400 && /大模型|配置/.test(d.detail || '')) { promptConfig(); }
+        else { showFeed(d.detail || '启动失败', 'error'); }
+        return;
+    }
+    answerTaskId = d.task_id;
+    document.getElementById('answer-start-btn').style.display = 'none';
+    document.getElementById('answer-stop-btn').style.display = '';
+    if (answerTimer) clearInterval(answerTimer);
+    answerTimer = setInterval(pollAnswer, 800);
+});
+
+document.getElementById('answer-stop-btn').addEventListener('click', async () => {
+    if (!answerTaskId) return;
+    const go = await uiConfirm({
+        title: '停止答题',
+        message: '确定停止当前答题任务？已生成的答案会保留。',
+        okText: '停止', danger: true, iconHref: '#i-stop',
+    });
+    if (!go) return;
+    await fetch(`/api/answer/${answerTaskId}/stop`, {method:'POST'});
+    showFeed('正在停止…', 'info');
+});
+
+function renderAnswerSteps(steps) {
+    const list = document.getElementById('answer-log');
+    const frag = document.createDocumentFragment();
+    steps.forEach(s => {
+        const row = document.createElement('div');
+        row.className = `req-row req-${s.status || 'info'}`;
+        const ph = document.createElement('span'); ph.className = 'req-phase';
+        ph.innerHTML = svg('#i-book') + '答题';
+        const st = document.createElement('span'); st.className = 'req-status';
+        st.innerHTML = svg(STATUS_ICON[s.status] || '#i-info');
+        const msg = document.createElement('span'); msg.className = 'req-msg'; msg.textContent = s.message || '';
+        row.append(ph, st, msg); frag.appendChild(row);
+    });
+    list.appendChild(frag);
+    list.scrollTop = list.scrollHeight;
+}
+
+function finishAnswer(fullBar) {
+    if (answerTimer) { clearInterval(answerTimer); answerTimer = null; }
+    answerTaskId = null;
+    if (fullBar) document.getElementById('answer-bar').style.width = '100%';
+    document.getElementById('answer-start-btn').style.display = '';
+    document.getElementById('answer-stop-btn').style.display = 'none';
+}
+
+function pollAnswer() {
+    if (!answerTaskId) return;
+    fetch(`/api/answer/${answerTaskId}/progress`).then(async r => {
+        if (!r.ok) {
+            finishAnswer(false);
+            showFeed('任务已失效（可能服务已重启）', 'error');
+            return null;
+        }
+        return r.json();
+    }).then(data => {
+        if (!data) return;
+        const s = data.stats || {};
+        document.getElementById('a-total').textContent = s.total || 0;
+        document.getElementById('a-done').textContent = s.answered || 0;
+        document.getElementById('a-questions').textContent = s.questions || 0;
+        document.getElementById('a-failed').textContent = s.failed || 0;
+        const steps = data.steps || [];
+        if (steps.length > answerLast) { renderAnswerSteps(steps.slice(answerLast)); answerLast = steps.length; }
+
+        const latest = steps[steps.length - 1];
+        const done = (s.answered||0) + (s.failed||0);
+        const pct = s.total ? Math.round(done / s.total * 100) : 0;
+        document.getElementById('answer-bar').style.width = pct + '%';
+        document.getElementById('answer-text').textContent = latest ? latest.message : '准备中…';
+
+        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed') {
+            finishAnswer('ok');
+            const ok = data.status === 'done';
+            showFeed(ok ? '答题完成' : (data.status === 'stopped' ? '答题已停止' : '答题失败'),
+                     ok ? 'success' : (data.status === 'stopped' ? 'info' : 'error'));
+            if (ok) setTimeout(() => location.reload(), 2000);
+        }
+    }).catch(() => {});
+}
+</script>
+{% endblock %}

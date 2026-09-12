@@ -6,9 +6,7 @@
 <div class="page-head">
     <div>
         <h1 class="page-title">爬取日志</h1>
-        <p class="page-sub">
-            共 {{ tasks|length }} 条任务记录 · 每次任务完成后自动归档至本地 SQLite
-        </p>
+        <p class="page-sub">共 {{ tasks|length }} 条任务记录</p>
     </div>
     {% if tasks %}
     <button class="btn btn-sm btn-danger" onclick="clearAll()">
@@ -194,13 +192,23 @@ document.addEventListener('keydown', e => {
 });
 
 async function deleteTask(taskId) {
-    if (!confirm('确定删除此任务记录？')) return;
+    const go = await uiConfirm({
+        title: '删除任务记录',
+        message: '确定删除此任务记录？',
+        okText: '删除', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
     location.reload();
 }
 
 async function clearAll() {
-    if (!confirm('确定清空全部历史日志？此操作不可恢复。')) return;
+    const go = await uiConfirm({
+        title: '清空历史日志',
+        message: '确定清空全部爬取历史日志？此操作不可恢复。',
+        okText: '全部清空', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch('/api/tasks', { method: 'DELETE' });
     location.reload();
 }

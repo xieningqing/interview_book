@@ -52,6 +52,10 @@ def init_db():
                 keyword_id INTEGER,
                 source TEXT DEFAULT 'nowcoder',
                 created_at TEXT NOT NULL,
+                raw_content TEXT,
+                cleaned_at TEXT,
+                answered_at TEXT,
+                is_irrelevant INTEGER DEFAULT 0,
                 FOREIGN KEY (keyword_id) REFERENCES keywords(id)
             );
 
@@ -59,6 +63,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 interview_id INTEGER NOT NULL,
                 question TEXT NOT NULL,
+                answer TEXT,
+                ai_answer TEXT,
                 FOREIGN KEY (interview_id) REFERENCES interviews(id) ON DELETE CASCADE
             );
 
@@ -83,6 +89,23 @@ def init_db():
                 FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE SET NULL
             );
         """)
+        # 旧库平滑升级：补齐后续版本新增的列
+        existed = {r[1] for r in conn.execute("PRAGMA table_info(interviews)")}
+        for col, decl in (
+            ("raw_content", "TEXT"),
+            ("cleaned_at", "TEXT"),
+            ("answered_at", "TEXT"),
+            ("is_irrelevant", "INTEGER DEFAULT 0"),
+        ):
+            if col not in existed:
+                conn.execute(f"ALTER TABLE interviews ADD COLUMN {col} {decl}")
+        q_existed = {r[1] for r in conn.execute("PRAGMA table_info(questions)")}
+        for col, decl in (
+            ("answer", "TEXT"),
+            ("ai_answer", "TEXT"),
+        ):
+            if col not in q_existed:
+                conn.execute(f"ALTER TABLE questions ADD COLUMN {col} {decl}")
         conn.commit()
         logger.info("✓ 数据库初始化完成")
     finally:
@@ -249,19 +272,41 @@ def save_interviews(keyword_id: int, interviews: list[dict]) -> tuple[int, list[
         conn.close()
 
 
-def list_interviews(keyword_id: Optional[int] = None, limit: int = 100, offset: int = 0) -> list[dict]:
+def count_interviews(keyword_id: Optional[int] = None, include_irrelevant: bool = False) -> int:
+    """统计面经总数（可按关键词筛选；默认排除标记为不相关的面经）"""
     conn = get_connection()
     try:
-        if keyword_id:
-            rows = conn.execute(
-                "SELECT * FROM interviews WHERE keyword_id = ? ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-                (keyword_id, limit, offset)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM interviews ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-                (limit, offset)
-            ).fetchall()
+        where, params = _interview_where(keyword_id, include_irrelevant)
+        row = conn.execute(f"SELECT COUNT(*) FROM interviews {where}", params).fetchone()
+        return row[0]
+    finally:
+        conn.close()
+
+
+def _interview_where(keyword_id: Optional[int], include_irrelevant: bool) -> tuple[str, list]:
+    clauses = []
+    params = []
+    if keyword_id:
+        clauses.append("keyword_id = ?")
+        params.append(keyword_id)
+    if not include_irrelevant:
+        clauses.append("COALESCE(is_irrelevant, 0) = 0")
+    return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def list_interviews(
+    keyword_id: Optional[int] = None,
+    limit: int = 100,
+    offset: int = 0,
+    include_irrelevant: bool = False,
+) -> list[dict]:
+    conn = get_connection()
+    try:
+        where, params = _interview_where(keyword_id, include_irrelevant)
+        rows = conn.execute(
+            f"SELECT * FROM interviews {where} ORDER BY publish_time DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
 
         results = []
         for r in rows:
@@ -318,13 +363,239 @@ def delete_interview(id: int):
         conn.close()
 
 
+# ========== 大模型清洗 ==========
+
+def list_clean_targets(keyword_id: int) -> list[dict]:
+    """
+    取出某关键词下待清洗的面经：
+    已清洗过（cleaned_at 非空）或已判定不相关的都跳过，保证增量数据只清洗一次。
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT id, title, content, keyword_id, COALESCE(is_irrelevant,0) AS is_irrelevant
+               FROM interviews
+               WHERE keyword_id = ?
+                 AND COALESCE(is_irrelevant,0) = 0
+                 AND cleaned_at IS NULL
+               ORDER BY publish_time DESC""",
+            (keyword_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_cleaned_interview(interview_id: int, cleaned_content: str, qa: list[dict]) -> None:
+    """保存大模型清洗结果：原文备份到 raw_content，正文替换为结构化问答，问答列表重建。
+    qa: [{"q": 问题, "a": 原回答}]；重新清洗会清空旧的 AI 答案。"""
+    conn = get_connection()
+    try:
+        # 只备份第一次清洗前的原文，避免重复清洗覆盖掉真正的原始内容
+        conn.execute(
+            """UPDATE interviews
+               SET raw_content = COALESCE(raw_content, content),
+                   content = ?,
+                   cleaned_at = ?,
+                   answered_at = NULL,
+                   is_irrelevant = 0
+               WHERE id = ?""",
+            (cleaned_content, datetime.now().isoformat(), interview_id),
+        )
+        conn.execute("DELETE FROM questions WHERE interview_id = ?", (interview_id,))
+        conn.executemany(
+            "INSERT INTO questions (interview_id, question, answer) VALUES (?, ?, ?)",
+            [(interview_id, item["q"], item.get("a") or None) for item in qa],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ========== AI 答题 ==========
+
+def get_qa_pairs(interview_id: int) -> list[dict]:
+    """取某篇面经的结构化问答（按清洗时顺序），供 AI 答题与详情页对照展示"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, question, answer, ai_answer FROM questions WHERE interview_id = ? ORDER BY id",
+            (interview_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def backfill_question_answers(interview_id: int, qa: list[dict]) -> int:
+    """旧版清洗数据 questions.answer 为空：按顺序用正文解析出的原回答回填。
+    仅当解析条数与 questions 行数完全一致时才回填，避免错位；返回回填行数。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM questions WHERE interview_id = ? ORDER BY id",
+            (interview_id,),
+        ).fetchall()
+        if len(rows) != len(qa):
+            logger.info(
+                "跳过旧答案回填：interview=%s 问题行数 %d 与解析条数 %d 不一致",
+                interview_id, len(rows), len(qa),
+            )
+            return 0
+        for row, item in zip(rows, qa):
+            ans = (item.get("a") or "").strip() or None
+            conn.execute("UPDATE questions SET answer = ? WHERE id = ?", (ans, row["id"]))
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def list_answer_targets(keyword_id: int) -> list[dict]:
+    """待 AI 答题的面经：已清洗、未判不相关、尚未答过（增量）"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT id, title, content, position, keyword_id
+               FROM interviews
+               WHERE keyword_id = ?
+                 AND COALESCE(is_irrelevant,0) = 0
+                 AND cleaned_at IS NOT NULL
+                 AND answered_at IS NULL
+               ORDER BY publish_time DESC""",
+            (keyword_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_ai_answers(interview_id: int, answers: list[dict]) -> int:
+    """保存一篇面经的 AI 答案。
+    answers: [{"question_id": int, "ai_answer": str}]，空串/None 表示该题跳过。
+    仅更新当前仍属于该面经的题目（防止与「重新清洗」并发时 UPDATE 落空）；
+    没有任何有效命中时不置 answered_at，返回 0，由调用方按失败处理。"""
+    conn = get_connection()
+    try:
+        valid_ids = {
+            r["id"] for r in conn.execute(
+                "SELECT id FROM questions WHERE interview_id = ?", (interview_id,)
+            ).fetchall()
+        }
+        items = [x for x in answers if x.get("question_id") in valid_ids]
+        if not items:
+            conn.rollback()
+            return 0
+        for item in items:
+            text = (item.get("ai_answer") or "").strip() or None
+            conn.execute(
+                "UPDATE questions SET ai_answer = ? WHERE id = ? AND interview_id = ?",
+                (text, item["question_id"], interview_id),
+            )
+        conn.execute(
+            "UPDATE interviews SET answered_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), interview_id),
+        )
+        conn.commit()
+        return len(items)
+    finally:
+        conn.close()
+
+
+def mark_interview_irrelevant(interview_id: int, irrelevant: bool = True) -> None:
+    """
+    标记/取消标记「与关键词不相关」（软删除，不删数据）。
+    标记时记 cleaned_at 避免重复调模型；
+    恢复时清 cleaned_at，使其回到「待清洗」，下次批量可重新处理。
+    """
+    conn = get_connection()
+    try:
+        if irrelevant:
+            conn.execute(
+                """UPDATE interviews
+                   SET is_irrelevant = 1, cleaned_at = COALESCE(cleaned_at, ?)
+                   WHERE id = ?""",
+                (datetime.now().isoformat(), interview_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE interviews SET is_irrelevant = 0, cleaned_at = NULL WHERE id = ?",
+                (interview_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_irrelevant(keyword_id: Optional[int] = None, limit: int = 20, offset: int = 0) -> list[dict]:
+    """归档区：列出被判定不相关的面经（可按关键词筛选）"""
+    conn = get_connection()
+    try:
+        where, params = ("WHERE i.is_irrelevant = 1 AND i.keyword_id = ?", [keyword_id]) \
+            if keyword_id else ("WHERE i.is_irrelevant = 1", [])
+        rows = conn.execute(
+            f"""SELECT i.*, k.name AS keyword_name
+                FROM interviews i LEFT JOIN keywords k ON k.id = i.keyword_id
+                {where} ORDER BY i.cleaned_at DESC LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_irrelevant(keyword_id: Optional[int] = None) -> int:
+    conn = get_connection()
+    try:
+        if keyword_id:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM interviews WHERE is_irrelevant = 1 AND keyword_id = ?",
+                (keyword_id,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM interviews WHERE is_irrelevant = 1").fetchone()
+        return row[0]
+    finally:
+        conn.close()
+
+
+def get_clean_stats() -> dict:
+    """清洗概况：总数 / 已清洗 / 已答题 / 不相关 / 待清洗"""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT
+                 COUNT(*) AS total,
+                 SUM(CASE WHEN cleaned_at IS NOT NULL AND COALESCE(is_irrelevant,0) = 0 THEN 1 ELSE 0 END) AS cleaned,
+                 SUM(CASE WHEN answered_at IS NOT NULL AND COALESCE(is_irrelevant,0) = 0 THEN 1 ELSE 0 END) AS answered,
+                 SUM(COALESCE(is_irrelevant,0)) AS irrelevant,
+                 SUM(CASE WHEN cleaned_at IS NULL AND COALESCE(is_irrelevant,0) = 0 THEN 1 ELSE 0 END) AS pending
+               FROM interviews"""
+        ).fetchone()
+        return {
+            "total": row["total"] or 0,
+            "cleaned": row["cleaned"] or 0,
+            "answered": row["answered"] or 0,
+            "irrelevant": row["irrelevant"] or 0,
+            "pending": row["pending"] or 0,
+        }
+    finally:
+        conn.close()
+
+
 def get_stats() -> dict:
     """获取总体统计"""
     conn = get_connection()
     try:
         keyword_count = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
-        interview_count = conn.execute("SELECT COUNT(*) FROM interviews").fetchone()[0]
-        question_count = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+        interview_count = conn.execute(
+            "SELECT COUNT(*) FROM interviews WHERE COALESCE(is_irrelevant,0) = 0"
+        ).fetchone()[0]
+        question_count = conn.execute(
+            """SELECT COUNT(*) FROM questions q
+               JOIN interviews i ON i.id = q.interview_id
+               WHERE COALESCE(i.is_irrelevant,0) = 0"""
+        ).fetchone()[0]
         latest = conn.execute(
             "SELECT MAX(publish_time) as latest FROM interviews"
         ).fetchone()["latest"]

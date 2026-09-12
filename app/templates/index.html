@@ -3,16 +3,6 @@
 
 {% block content %}
 
-<div class="page-head">
-    <div>
-        <h1 class="page-title">关键词控制台</h1>
-        <p class="page-sub">管理搜索关键词 · 发起爬取 · 实时监控抓取进度</p>
-    </div>
-    <button class="btn btn-lg btn-primary" onclick="document.getElementById('kw-name').focus()">
-        <svg class="icon"><use href="#i-plus"/></svg><span>新建关键词</span>
-    </button>
-</div>
-
 <!-- 统计概览 -->
 <div class="stats-row">
     <div class="stat-card">
@@ -49,7 +39,6 @@
 <div class="card">
     <div class="card-head">
         <div class="card-title"><svg class="icon"><use href="#i-plus"/></svg>添加关键词</div>
-        <span class="card-note">保存后可随时重复爬取</span>
     </div>
     <form id="keyword-form" class="form-inline">
         <div class="form-group grow">
@@ -83,7 +72,6 @@
 <div class="card">
     <div class="card-head">
         <div class="card-title"><svg class="icon"><use href="#i-zap"/></svg>发起爬取</div>
-        <span class="card-note">选择已保存关键词，或临时输入一个直接跑</span>
     </div>
     <form id="quick-crawl-form" class="form-inline">
         <div class="form-group grow">
@@ -302,7 +290,12 @@ async function saveKeyword(crawlAfter) {
 }
 
 async function deleteKeyword(id) {
-    if (!confirm('确定删除此关键词？关联的面经也会被一并删除。')) return;
+    const go = await uiConfirm({
+        title: '删除关键词',
+        message: '确定删除此关键词？关联的面经也会被一并删除，爬取历史会保留。',
+        okText: '删除', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch(`/api/keywords/${id}`, { method: 'DELETE' });
     location.reload();
 }
@@ -353,7 +346,12 @@ async function crawlById(keywordId) {
 }
 
 async function crawlAll() {
-    if (!confirm('确定爬取全部关键词？')) return;
+    const go = await uiConfirm({
+        title: '爬取全部关键词',
+        message: '将同时为所有已保存关键词启动爬取任务，建议确认已配置好 Cookie / 代理。',
+        okText: '全部开始', iconHref: '#i-play',
+    });
+    if (!go) return;
     const resp = await fetch('/api/crawl-all', { method: 'POST' });
     if (resp.ok) showFeed('已启动全部关键词任务', 'success');
     else showFeed('启动失败', 'error');
@@ -378,7 +376,12 @@ function setStopButton(state) {
 
 async function stopTask() {
     if (!currentTaskId) return;
-    if (!confirm('确定停止当前爬取任务？已抓取的面经会保留入库。')) return;
+    const go = await uiConfirm({
+        title: '停止爬取',
+        message: '确定停止当前爬取任务？已抓取的面经会保留入库。',
+        okText: '停止', danger: true, iconHref: '#i-stop',
+    });
+    if (!go) return;
     const btn = document.getElementById('stop-task-btn');
     btn.disabled = true;
     btn.innerHTML = svg('#i-stop') + '<span>停止中…</span>';
@@ -531,7 +534,13 @@ async function pollProgress() {
     let data;
     try {
         const resp = await fetch(`/api/task/${currentTaskId}/progress`);
-        if (!resp.ok) return;
+        if (!resp.ok) {
+            // 任务不存在（如服务重启）：停止轮询，避免无限空转
+            stopPolling();
+            document.getElementById('progress-text').innerHTML =
+                svg('#i-x-circle') + '任务已失效（可能服务已重启）';
+            return;
+        }
         data = await resp.json();
     } catch (e) {
         return;

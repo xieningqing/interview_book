@@ -23,7 +23,11 @@ from app.storage import database as db
 from app.storage import file_store
 from app.storage import cookie_manager
 from app.storage import proxy_manager
+from app.storage import llm_config
 from app.crawler import nowcoder
+from app.ai import llm as ai_llm
+from app.ai import cleaner as ai_cleaner
+from app.ai import answerer as ai_answerer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,6 +91,21 @@ class ProxyUpdate(BaseModel):
     strategy: Optional[str] = None          # round_robin / random / first
 
 
+class LLMConfigUpdate(BaseModel):
+    """大模型接口配置（OpenAI 兼容）"""
+    base_url: str
+    api_key: Optional[str] = None           # 留空表示不修改
+    model: str
+
+
+class CleanRequest(BaseModel):
+    keyword_id: int
+
+
+class AnswerRequest(BaseModel):
+    keyword_id: int
+
+
 # ============ 页面路由 ============
 
 @app.get("/", response_class=HTMLResponse)
@@ -100,18 +119,50 @@ async def index(request: Request):
     )
 
 
+INTERVIEWS_PAGE_SIZE = 12
+
+
+def _page_window(page: int, total_pages: int, span: int = 1) -> list:
+    """页码窗口：首尾页必显，当前页前后各 span 页，缺口用 None（省略号）表示"""
+    kept = [
+        p for p in range(1, total_pages + 1)
+        if p == 1 or p == total_pages or abs(p - page) <= span
+    ]
+    items = []
+    prev = 0
+    for p in kept:
+        if p - prev > 1:
+            items.append(None)
+        items.append(p)
+        prev = p
+    return items
+
+
 @app.get("/interviews", response_class=HTMLResponse)
-async def interviews_page(request: Request, keyword_id: Optional[int] = None):
-    """面经列表页"""
+async def interviews_page(request: Request, keyword_id: Optional[int] = None, page: int = 1):
+    """面经列表页（服务端分页）"""
     keywords = db.list_keywords()
-    interviews = db.list_interviews(keyword_id=keyword_id, limit=500)
     selected_kw = db.get_keyword(keyword_id) if keyword_id else None
+
+    total = db.count_interviews(keyword_id=keyword_id)
+    total_pages = max(1, (total + INTERVIEWS_PAGE_SIZE - 1) // INTERVIEWS_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    interviews = db.list_interviews(
+        keyword_id=keyword_id,
+        limit=INTERVIEWS_PAGE_SIZE,
+        offset=(page - 1) * INTERVIEWS_PAGE_SIZE,
+    )
     return templates.TemplateResponse(
         request, "interviews.html",
         {
             "interviews": interviews,
             "keywords": keywords,
             "selected_keyword": selected_kw,
+            "page": page,
+            "total_pages": total_pages,
+            "total": total,
+            "page_size": INTERVIEWS_PAGE_SIZE,
+            "page_items": _page_window(page, total_pages),
         },
     )
 
@@ -122,9 +173,14 @@ async def interview_detail(request: Request, interview_id: int):
     inv = db.get_interview(interview_id)
     if not inv:
         raise HTTPException(status_code=404, detail="面经不存在")
+    qa_pairs = db.get_qa_pairs(interview_id)
     return templates.TemplateResponse(
         request, "detail.html",
-        {"interview": inv},
+        {
+            "interview": inv,
+            "qa_pairs": qa_pairs,
+            "llm_configured": ai_llm.is_configured(),
+        },
     )
 
 
@@ -186,6 +242,19 @@ running_tasks: dict[str, asyncio.Task] = {}
 # 每个任务的协作式停止信号
 stop_events: dict[str, asyncio.Event] = {}
 
+# 内存态进度只保留最近若干条已结束任务，避免长期运行无限增长
+_MAX_INMEM_TASKS = 100
+
+
+def _prune_inmem(store: dict):
+    if len(store) <= _MAX_INMEM_TASKS:
+        return
+    for tid in list(store.keys()):
+        if len(store) <= _MAX_INMEM_TASKS:
+            break
+        if store[tid].get("status") in ("done", "failed", "stopped") and tid not in running_tasks:
+            store.pop(tid, None)
+
 
 @app.post("/api/crawl")
 async def api_crawl(req: CrawlRequest):
@@ -213,6 +282,7 @@ async def api_crawl(req: CrawlRequest):
         "result": None,
     }
     task_status[task_id] = progress
+    _prune_inmem(task_status)
 
     # 解析参数
     keyword_obj = None
@@ -539,3 +609,301 @@ async def api_delete_task(task_id: str):
 async def api_clear_tasks():
     db.clear_all_crawl_tasks()
     return {"message": "已清空全部任务日志"}
+
+
+# ============ 数据清洗（大模型） ============
+
+# 清洗任务内存态：task_id -> progress / asyncio.Task / stop_event
+clean_status: dict = {}
+clean_running: dict[str, asyncio.Task] = {}
+clean_events: dict[str, asyncio.Event] = {}
+cleaning_keywords: set[int] = set()   # 正在清洗的关键词，防止同关键词并发重复跑
+
+
+@app.get("/clean", response_class=HTMLResponse)
+async def clean_page(request: Request):
+    """数据清洗页"""
+    return templates.TemplateResponse(
+        request, "clean.html",
+        {
+            "keywords": db.list_keywords(),
+            "llm_status": llm_config.get_status(),
+            "clean_stats": db.get_clean_stats(),
+        },
+    )
+
+
+ARCHIVE_PAGE_SIZE = 20
+
+
+@app.get("/clean/archive", response_class=HTMLResponse)
+async def clean_archive_page(request: Request, keyword_id: Optional[int] = None, page: int = 1):
+    """清洗归档：被判定不相关而隐藏的面经，可查看/恢复"""
+    total = db.count_irrelevant(keyword_id)
+    total_pages = max(1, (total + ARCHIVE_PAGE_SIZE - 1) // ARCHIVE_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    items = db.list_irrelevant(
+        keyword_id, limit=ARCHIVE_PAGE_SIZE, offset=(page - 1) * ARCHIVE_PAGE_SIZE
+    )
+    selected_kw = db.get_keyword(keyword_id) if keyword_id else None
+    return templates.TemplateResponse(
+        request, "archive.html",
+        {
+            "items": items,
+            "keywords": db.list_keywords(),
+            "selected_keyword": selected_kw,
+            "page": page,
+            "total_pages": total_pages,
+            "total": total,
+            "page_items": _page_window(page, total_pages),
+        },
+    )
+
+
+@app.get("/api/llm/config")
+async def api_get_llm_config():
+    return llm_config.get_status()
+
+
+@app.post("/api/llm/config")
+async def api_save_llm_config(data: LLMConfigUpdate):
+    if not data.base_url.strip() or not data.model.strip():
+        raise HTTPException(status_code=400, detail="base_url 和模型名不能为空")
+    if not data.api_key and not llm_config.load_config().get("api_key"):
+        raise HTTPException(status_code=400, detail="首次配置必须填写 API Key")
+    llm_config.save_config(data.base_url, data.api_key or "", data.model)
+    return {"message": "✓ 大模型配置已保存", "status": llm_config.get_status()}
+
+
+@app.post("/api/llm/test")
+async def api_test_llm():
+    if not ai_llm.is_configured():
+        return {"ok": False, "message": "请先完整配置 base_url / API Key / 模型"}
+    try:
+        result = await ai_llm.ping()
+        return {"ok": True, "message": f"连接成功，模型回复：{result['reply']}"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:150]}
+
+
+@app.post("/api/clean")
+async def api_start_clean(req: CleanRequest):
+    """启动某关键词下的批量清洗"""
+    keyword = db.get_keyword(req.keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="关键词不存在")
+    if not ai_llm.is_configured():
+        raise HTTPException(status_code=400, detail="请先在数据清洗页配置大模型接口")
+    if req.keyword_id in cleaning_keywords:
+        raise HTTPException(status_code=409, detail="该关键词正在清洗中，请勿重复启动")
+
+    task_id = f"clean_{uuid.uuid4().hex[:16]}"
+    progress = {
+        "task_id": task_id,
+        "keyword": keyword["name"],
+        "status": "running",
+        "steps": [],
+        "stats": {"total": 0, "cleaned": 0, "irrelevant": 0, "failed": 0},
+    }
+    clean_status[task_id] = progress
+    _prune_inmem(clean_status)
+
+    async def run():
+        def on_step(step: dict):
+            progress["steps"].append(step)
+            if isinstance(step.get("total"), int) and step["total"] > 0:
+                progress["stats"]["total"] = step["total"]
+            for k in ("cleaned", "irrelevant", "failed"):
+                v = step.get("extra", {}).get(k)
+                if isinstance(v, int):
+                    progress["stats"][k] = v
+
+        stop_event = clean_events[task_id]
+        try:
+            stats = await ai_cleaner.clean_batch(
+                keyword["id"], keyword["name"],
+                progress_cb=on_step, stop_event=stop_event,
+            )
+            progress["stats"] = {"total": stats["total"], **{k: stats[k] for k in ("cleaned", "irrelevant", "failed")}}
+            last = progress["steps"][-1] if progress["steps"] else {}
+            progress["status"] = "stopped" if last.get("extra", {}).get("stopped") else "done"
+        except Exception as e:
+            logger.exception("清洗任务失败")
+            progress["status"] = "failed"
+            progress["steps"].append({
+                "step": "error", "phase": "clean", "status": "failed",
+                "message": f"❌ {str(e)[:120]}", "current": 0, "total": 0, "extra": {},
+            })
+        finally:
+            clean_running.pop(task_id, None)
+            clean_events.pop(task_id, None)
+            cleaning_keywords.discard(keyword["id"])
+
+    clean_events[task_id] = asyncio.Event()
+    cleaning_keywords.add(keyword["id"])
+    clean_running[task_id] = asyncio.create_task(run())
+    return {"task_id": task_id, "status": "running", "message": "清洗任务已启动"}
+
+
+@app.get("/api/clean/{task_id}/progress")
+async def api_clean_progress(task_id: str):
+    progress = clean_status.get(task_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return progress
+
+
+@app.post("/api/clean/{task_id}/stop")
+async def api_stop_clean(task_id: str):
+    task = clean_running.get(task_id)
+    if not task or task.done():
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    ev = clean_events.get(task_id)
+    if ev is not None:
+        ev.set()
+    return {"message": "正在停止…"}
+
+
+@app.post("/api/interviews/{interview_id}/clean")
+async def api_clean_one(interview_id: int):
+    """清洗单篇（详情页按钮）"""
+    if not ai_llm.is_configured():
+        raise HTTPException(status_code=400, detail="请先在数据清洗页配置大模型接口")
+    inv = db.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="面经不存在")
+    kid = inv.get("keyword_id")
+    if kid in cleaning_keywords or kid in answering_keywords:
+        raise HTTPException(status_code=409, detail="该关键词正在批量清洗/答题，请等待任务结束后再操作单篇")
+    keyword = db.get_keyword(inv["keyword_id"]) if inv.get("keyword_id") else None
+    keyword_name = keyword["name"] if keyword else inv.get("title", "")
+    try:
+        result = await ai_cleaner.clean_one(inv, keyword_name)
+    except Exception as e:
+        logger.warning(f"单篇清洗失败 {interview_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"大模型清洗失败：{str(e)[:120]}")
+    return {"message": "已标记为不相关" if result["action"] == "irrelevant"
+            else f"清洗完成（{result['questions']} 个问答）", **result}
+
+
+@app.post("/api/interviews/{interview_id}/answer")
+async def api_answer_one(interview_id: int):
+    """为单篇已清洗面经生成 AI 参考答案（详情页按钮）"""
+    if not ai_llm.is_configured():
+        raise HTTPException(status_code=400, detail="请先在数据清洗页配置大模型接口")
+    inv = db.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="面经不存在")
+    if not inv.get("cleaned_at") or inv.get("is_irrelevant"):
+        raise HTTPException(status_code=400, detail="请先完成清洗，再生成 AI 答案")
+    kid = inv.get("keyword_id")
+    if kid in answering_keywords or kid in cleaning_keywords:
+        raise HTTPException(status_code=409, detail="该关键词正在批量答题/清洗，请等待任务结束后再操作单篇")
+    keyword = db.get_keyword(inv["keyword_id"]) if inv.get("keyword_id") else None
+    keyword_name = keyword["name"] if keyword else inv.get("title", "")
+    try:
+        result = await ai_answerer.answer_interview(inv, keyword_name)
+    except Exception as e:
+        logger.warning(f"单篇 AI 答题失败 {interview_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"AI 答题失败：{str(e)[:120]}")
+    return {"message": f"已生成 {result['answered']} 题参考答案（跳过 {result['skipped']} 题）", **result}
+
+
+@app.post("/api/interviews/{interview_id}/restore")
+async def api_restore_interview(interview_id: int):
+    """取消「不相关」标记"""
+    inv = db.get_interview(interview_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="面经不存在")
+    db.mark_interview_irrelevant(interview_id, False)
+    return {"message": "✓ 已恢复，面经重新出现在列表中"}
+
+
+# ============ AI 答题（清洗之后的第二道链路） ============
+
+# 答题任务内存态：task_id -> progress / asyncio.Task / stop_event
+answer_status: dict = {}
+answer_running: dict[str, asyncio.Task] = {}
+answer_events: dict[str, asyncio.Event] = {}
+answering_keywords: set[int] = set()   # 正在答题的关键词，防止并发重复跑
+
+
+@app.post("/api/answer")
+async def api_start_answer(req: AnswerRequest):
+    """启动某关键词下已清洗面经的批量 AI 答题"""
+    keyword = db.get_keyword(req.keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="关键词不存在")
+    if not ai_llm.is_configured():
+        raise HTTPException(status_code=400, detail="请先在数据清洗页配置大模型接口")
+    if req.keyword_id in answering_keywords:
+        raise HTTPException(status_code=409, detail="该关键词正在答题中，请勿重复启动")
+
+    task_id = f"answer_{uuid.uuid4().hex[:16]}"
+    progress = {
+        "task_id": task_id,
+        "keyword": keyword["name"],
+        "status": "running",
+        "steps": [],
+        "stats": {"total": 0, "answered": 0, "questions": 0, "skipped": 0, "failed": 0},
+    }
+    answer_status[task_id] = progress
+    _prune_inmem(answer_status)
+
+    async def run():
+        def on_step(step: dict):
+            progress["steps"].append(step)
+            if isinstance(step.get("total"), int) and step["total"] > 0:
+                progress["stats"]["total"] = step["total"]
+            for k in ("answered", "questions", "skipped", "failed"):
+                v = step.get("extra", {}).get(k)
+                if isinstance(v, int):
+                    progress["stats"][k] = v
+
+        stop_event = answer_events[task_id]
+        try:
+            stats = await ai_answerer.answer_batch(
+                keyword["id"], keyword["name"],
+                progress_cb=on_step, stop_event=stop_event,
+            )
+            progress["stats"] = {
+                "total": stats["total"],
+                **{k: stats[k] for k in ("answered", "questions", "skipped", "failed")},
+            }
+            last = progress["steps"][-1] if progress["steps"] else {}
+            progress["status"] = "stopped" if last.get("extra", {}).get("stopped") else "done"
+        except Exception as e:
+            logger.exception("AI 答题任务失败")
+            progress["status"] = "failed"
+            progress["steps"].append({
+                "step": "error", "phase": "answer", "status": "failed",
+                "message": f"❌ {str(e)[:120]}", "current": 0, "total": 0, "extra": {},
+            })
+        finally:
+            answer_running.pop(task_id, None)
+            answer_events.pop(task_id, None)
+            answering_keywords.discard(keyword["id"])
+
+    answer_events[task_id] = asyncio.Event()
+    answering_keywords.add(keyword["id"])
+    answer_running[task_id] = asyncio.create_task(run())
+    return {"task_id": task_id, "status": "running", "message": "AI 答题任务已启动"}
+
+
+@app.get("/api/answer/{task_id}/progress")
+async def api_answer_progress(task_id: str):
+    progress = answer_status.get(task_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return progress
+
+
+@app.post("/api/answer/{task_id}/stop")
+async def api_stop_answer(task_id: str):
+    task = answer_running.get(task_id)
+    if not task or task.done():
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    ev = answer_events.get(task_id)
+    if ev is not None:
+        ev.set()
+    return {"message": "正在停止…"}

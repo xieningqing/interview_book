@@ -6,7 +6,6 @@
 <div class="page-head">
     <div>
         <h1 class="page-title">IP 代理管理</h1>
-        <p class="page-sub">爬虫每次请求自动从池中选取代理 · 数据存于本地 <code>data/proxies.json</code></p>
     </div>
 </div>
 
@@ -14,7 +13,6 @@
 <div class="card">
     <div class="card-head">
         <div class="card-title"><svg class="icon"><use href="#i-server"/></svg>当前状态</div>
-        <span class="card-note">轮换策略决定每次请求如何挑选代理</span>
     </div>
 
     {% if proxy_status.enabled %}
@@ -145,7 +143,12 @@ async function testProxy() {
 }
 
 async function clearProxy() {
-    if (!confirm('确定清空全部代理？清空后将恢复直连。')) return;
+    const go = await uiConfirm({
+        title: '清空代理',
+        message: '确定清空全部代理？清空后将恢复直连。',
+        okText: '清空', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch('/api/proxy', { method: 'DELETE' });
     location.reload();
 }

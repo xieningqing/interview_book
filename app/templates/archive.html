@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}清洗归档 · 面经猎手{% endblock %}
+
+{% block content %}
+
+<div class="breadcrumb">
+    <a href="/clean"><svg class="icon"><use href="#i-chev-left"/></svg>返回数据清洗</a>
+</div>
+
+<div class="page-head">
+    <div>
+        <h1 class="page-title">清洗归档</h1>
+        <p class="page-sub">被 AI 判定为与关键词不相关而隐藏的面经，共 {{ total }} 篇；可查看原文或恢复到面经库</p>
+    </div>
+</div>
+
+<div class="card filter-card">
+    <form method="get" action="/clean/archive" class="filter-form">
+        <label for="kw-filter">关键词筛选</label>
+        <select id="kw-filter" name="keyword_id" onchange="this.form.submit()">
+            <option value="">全部关键词</option>
+            {% for kw in keywords %}
+            <option value="{{ kw.id }}" {% if selected_keyword and selected_keyword.id == kw.id %}selected{% endif %}>{{ kw.name }}</option>
+            {% endfor %}
+        </select>
+    </form>
+    {% if selected_keyword %}
+    <a href="/clean/archive" class="btn btn-sm btn-ghost">
+        <svg class="icon"><use href="#i-x"/></svg><span>清除筛选</span>
+    </a>
+    {% endif %}
+</div>
+
+{% if items %}
+<div class="card" style="padding:6px 0;">
+    <div class="table-wrap">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>标题</th>
+                    <th style="width:130px;">所属关键词</th>
+                    <th style="width:150px;">剔除时间</th>
+                    <th class="col-actions" style="width:150px;">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for it in items %}
+                <tr>
+                    <td><a href="/interviews/{{ it.id }}" class="kw-name">{{ it.title }}</a></td>
+                    <td class="muted">{{ it.keyword_name or '—' }}</td>
+                    <td class="mono muted" style="font-size:12px;">{{ it.cleaned_at[:16]|replace('T',' ') if it.cleaned_at else '—' }}</td>
+                    <td class="col-actions">
+                        <div class="btn-group">
+                            <a class="btn btn-sm btn-ghost" href="/interviews/{{ it.id }}">
+                                <svg class="icon"><use href="#i-eye"/></svg><span>查看</span>
+                            </a>
+                            <button class="btn btn-sm btn-primary" onclick="restoreOne({{ it.id }})">
+                                <svg class="icon"><use href="#i-undo"/></svg><span>恢复</span>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% set base %}/clean/archive?{% if selected_keyword %}keyword_id={{ selected_keyword.id }}&{% endif %}page={% endset %}
+{% if total_pages > 1 %}
+<nav class="pagination">
+    <span class="pagination-info">共 {{ total }} 篇 · 第 {{ page }} / {{ total_pages }} 页</span>
+    <div class="pagination-pages">
+        {% if page > 1 %}<a class="page-btn" href="{{ base }}{{ page - 1 }}"><svg class="icon"><use href="#i-chev-left"/></svg></a>
+        {% else %}<span class="page-btn disabled"><svg class="icon"><use href="#i-chev-left"/></svg></span>{% endif %}
+        {% for p in page_items %}
+            {% if p is none %}<span class="page-gap">…</span>
+            {% elif p == page %}<span class="page-btn active">{{ p }}</span>
+            {% else %}<a class="page-btn" href="{{ base }}{{ p }}">{{ p }}</a>{% endif %}
+        {% endfor %}
+        {% if page < total_pages %}<a class="page-btn" href="{{ base }}{{ page + 1 }}"><svg class="icon"><use href="#i-chev-right"/></svg></a>
+        {% else %}<span class="page-btn disabled"><svg class="icon"><use href="#i-chev-right"/></svg></span>{% endif %}
+    </div>
+</nav>
+{% endif %}
+
+{% else %}
+<div class="empty">
+    <div class="empty-badge"><svg class="icon"><use href="#i-archive"/></svg></div>
+    <div class="empty-title">归档区是空的</div>
+    <div class="empty-sub">
+        {% if selected_keyword %}该关键词下还没有被判定为不相关的面经{% else %}目前没有被剔除的面经{% endif %}
+    </div>
+    <a href="/clean" class="btn btn-primary btn-sm empty-action">
+        <svg class="icon"><use href="#i-wand"/></svg><span>去数据清洗</span>
+    </a>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function restoreOne(id) {
+    const go = await uiConfirm({
+        title: '恢复面经',
+        message: '将这篇面经恢复到面经库列表？\n它会重新进入待清洗队列，下次批量清洗时可再次处理。',
+        okText: '恢复', iconHref: '#i-undo',
+    });
+    if (!go) return;
+    const r = await fetch(`/api/interviews/${id}/restore`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { await uiAlert({title:'恢复失败', message:d.detail || '恢复失败', iconHref:'#i-x-circle'}); return; }
+    location.reload();
+}
+</script>
+{% endblock %}

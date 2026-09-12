@@ -22,10 +22,39 @@
             <svg class="icon"><use href="#i-external"/></svg>查看原文
         </a>
         {% endif %}
-        <button class="btn btn-sm btn-danger" onclick="deleteInterview({{ interview.id }})">
-            <svg class="icon"><use href="#i-trash"/></svg><span>删除</span>
+        <div class="btn-group">
+            <button id="clean-one-btn" class="btn btn-sm {% if interview.cleaned_at %}btn-ghost{% else %}btn-primary{% endif %}" onclick="cleanOne({{ interview.id }})">
+                <svg class="icon"><use href="#i-wand"/></svg><span>{% if interview.cleaned_at %}重新清洗{% else %}AI 清洗{% endif %}</span>
+            </button>
+            {% if interview.cleaned_at and not interview.is_irrelevant %}
+            <button id="answer-one-btn" class="btn btn-sm {% if interview.answered_at %}btn-ghost{% else %}btn-primary{% endif %}" onclick="answerOne({{ interview.id }})">
+                <svg class="icon"><use href="#i-book"/></svg><span>{% if interview.answered_at %}重新答题{% else %}AI 答题{% endif %}</span>
+            </button>
+            {% endif %}
+            <button class="btn btn-sm btn-danger" onclick="deleteInterview({{ interview.id }})">
+                <svg class="icon"><use href="#i-trash"/></svg><span>删除</span>
+            </button>
+        </div>
+    </div>
+
+    {% if interview.is_irrelevant %}
+    <div class="status-warn" style="margin-top:12px;">
+        <span>🏷️ 该面经已被 AI 判定为与搜索关键词不相关，已从面经库列表隐藏</span>
+        <button class="btn btn-sm btn-ghost" onclick="restoreInterview({{ interview.id }})" style="margin-left:auto;">
+            <svg class="icon"><use href="#i-undo"/></svg><span>恢复到列表</span>
         </button>
     </div>
+    {% endif %}
+
+    {% if interview.cleaned_at and not interview.is_irrelevant %}
+    <div class="cleaned-note">
+        <span class="clean-badge"><svg class="icon"><use href="#i-wand"/></svg>已清洗</span>
+        <span>AI 已将正文整理为结构化问答（{{ interview.cleaned_at[:16]|replace('T',' ') }}），原文已自动备份。</span>
+        {% if interview.answered_at %}
+        <span class="answer-badge"><svg class="icon"><use href="#i-book"/></svg>已生成 AI 参考答案</span>
+        {% endif %}
+    </div>
+    {% endif %}
 
     {% if interview.tags %}
     <div class="detail-tags">
@@ -36,7 +65,39 @@
     {% endif %}
 </div>
 
-{% if interview.questions %}
+{% set show_qa = interview.cleaned_at and not interview.is_irrelevant and qa_pairs %}
+{% if show_qa %}
+<div class="card">
+    <div class="detail-section" style="margin-bottom:0;">
+        <div class="section-title">问答对照 · {{ qa_pairs|length }} 题</div>
+        <div class="qa-list">
+            {% for qa in qa_pairs %}
+            <div class="qa-item">
+                <div class="qa-q"><span class="qa-index">{{ loop.index }}</span><span>{{ qa.question }}</span></div>
+                <div class="qa-pair">
+                    <div class="qa-block qa-ai">
+                        <div class="qa-label"><svg class="icon"><use href="#i-wand"/></svg>AI 参考答案</div>
+                        {% if qa.ai_answer %}
+                        <div class="qa-body">{{ qa.ai_answer }}</div>
+                        {% elif interview.answered_at %}
+                        <div class="qa-body qa-empty">该题无标准答案，已跳过</div>
+                        {% else %}
+                        <div class="qa-body qa-empty">尚未生成，点右上角「AI 答题」</div>
+                        {% endif %}
+                    </div>
+                    <div class="qa-block qa-raw">
+                        <div class="qa-label"><svg class="icon"><use href="#i-user"/></svg>面经原回答</div>
+                        <div class="qa-body{% if not qa.answer or qa.answer == '（面经中未给出明确答案）' %} qa-empty{% endif %}">
+                            {{ qa.answer if qa.answer else '（面经中未给出明确答案）' }}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% elif interview.questions %}
 <div class="card">
     <div class="detail-section">
         <div class="section-title">面试问题 · {{ interview.questions|length }} 道</div>
@@ -51,8 +112,15 @@
 
 <div class="card">
     <div class="detail-section" style="margin-bottom:0;">
+        {% if show_qa %}
+        <details class="raw-details">
+            <summary class="section-title" style="margin-bottom:0;">结构化正文</summary>
+            <div class="detail-content" style="margin-top:10px;">{{ interview.content }}</div>
+        </details>
+        {% else %}
         <div class="section-title">面经正文</div>
         <div class="detail-content">{{ interview.content }}</div>
+        {% endif %}
     </div>
 </div>
 
@@ -61,9 +129,90 @@
 {% block scripts %}
 <script>
 async function deleteInterview(id) {
-    if (!confirm('确定删除这篇面经？')) return;
+    const go = await uiConfirm({
+        title: '删除面经',
+        message: '确定删除这篇面经？删除后不可恢复。',
+        okText: '删除', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
     await fetch(`/api/interviews/${id}`, { method: 'DELETE' });
     window.location.href = '/interviews';
+}
+
+const LLM_CONFIGURED = {{ 'true' if llm_configured else 'false' }};
+const ALREADY_ANSWERED = {{ 'true' if interview.answered_at else 'false' }};
+
+async function cleanOne(id) {
+    if (!LLM_CONFIGURED) {
+        const go = await uiConfirm({
+            title: '需要先配置大模型',
+            message: '尚未配置大模型接口，无法清洗。\n是否前往「数据清洗」页配置？',
+            okText: '去配置', iconHref: '#i-wand',
+        });
+        if (go) window.location.href = '/clean';
+        return;
+    }
+    const go = await uiConfirm({
+        title: 'AI 清洗本篇',
+        message: '调用大模型清洗这篇面经？\n正文将被重排为结构化问答（原文会备份），若与关键词无关会被标记隐藏。',
+        okText: '开始清洗', iconHref: '#i-wand',
+    });
+    if (!go) return;
+    const btn = document.getElementById('clean-one-btn');
+    btn.disabled = true; btn.querySelector('span').textContent = '清洗中…';
+    try {
+        const r = await fetch(`/api/interviews/${id}/clean`, { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) {
+            await uiAlert({title: '清洗失败', message: d.detail || '清洗失败', iconHref: '#i-x-circle'});
+            btn.disabled = false; btn.querySelector('span').textContent = 'AI 清洗'; return;
+        }
+        await uiAlert({title: '清洗完成', message: d.message || '清洗完成', iconHref: '#i-check'});
+        location.reload();
+    } catch (e) {
+        await uiAlert({title: '清洗失败', message: '清洗请求失败：' + e.message, iconHref: '#i-x-circle'});
+        btn.disabled = false; btn.querySelector('span').textContent = 'AI 清洗';
+    }
+}
+
+async function restoreInterview(id) {
+    await fetch(`/api/interviews/${id}/restore`, { method: 'POST' });
+    location.reload();
+}
+
+async function answerOne(id) {
+    if (!LLM_CONFIGURED) {
+        const go = await uiConfirm({
+            title: '需要先配置大模型',
+            message: '尚未配置大模型接口，无法生成 AI 答案。\n是否前往「数据清洗」页配置？',
+            okText: '去配置', iconHref: '#i-book',
+        });
+        if (go) window.location.href = '/clean';
+        return;
+    }
+    const go = await uiConfirm({
+        title: 'AI 生成参考答案',
+        message: ALREADY_ANSWERED
+            ? '将重新调用大模型生成参考答案，并覆盖当前的 AI 答案（面经原回答不受影响）。'
+            : '将调用大模型为这篇面经的每道题生成简洁、贴切的参考答案。\n面经当事人的原回答会原样保留，形成上下对照。',
+        okText: '开始答题', iconHref: '#i-book',
+    });
+    if (!go) return;
+    const btn = document.getElementById('answer-one-btn');
+    btn.disabled = true; btn.querySelector('span').textContent = '答题中…';
+    try {
+        const r = await fetch(`/api/interviews/${id}/answer`, { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) {
+            await uiAlert({title: '答题失败', message: d.detail || '答题失败', iconHref: '#i-x-circle'});
+            btn.disabled = false; btn.querySelector('span').textContent = 'AI 答题'; return;
+        }
+        await uiAlert({title: '答题完成', message: d.message || '答题完成', iconHref: '#i-check'});
+        location.reload();
+    } catch (e) {
+        await uiAlert({title: '答题失败', message: '答题请求失败：' + e.message, iconHref: '#i-x-circle'});
+        btn.disabled = false; btn.querySelector('span').textContent = 'AI 答题';
+    }
 }
 </script>
 {% endblock %}
