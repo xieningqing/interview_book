@@ -6,6 +6,7 @@ FastAPI 主入口
 """
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # 启动时初始化数据库
     db.init_db()
+    # 回收上次进程遗留的 running 任务（强杀/重启时收尾落库不会执行）
+    try:
+        n = db.mark_interrupted_ai_tasks()
+        if n:
+            logger.warning(f"已将 {n} 个中断的清洗/答题任务标记为 interrupted")
+    except Exception as e:
+        logger.warning(f"回收中断任务失败: {e}")
     yield
     # 关闭时清理
     pass
@@ -92,10 +100,22 @@ class ProxyUpdate(BaseModel):
 
 
 class LLMConfigUpdate(BaseModel):
-    """大模型接口配置（OpenAI 兼容）"""
+    """大模型渠道配置；id 为空表示新增渠道"""
+    id: Optional[str] = None
+    name: Optional[str] = None
     base_url: str
-    api_key: Optional[str] = None           # 留空表示不修改
+    api_key: Optional[str] = None           # 编辑时留空表示不修改
     model: str
+    protocol: Optional[str] = None          # openai / anthropic，为空沿用原值
+    activate: bool = False                  # 保存后同时切为当前渠道
+
+
+class LLMActivate(BaseModel):
+    id: str
+
+
+class LLMTestRequest(BaseModel):
+    id: Optional[str] = None                # 测指定渠道；为空测当前渠道
 
 
 class CleanRequest(BaseModel):
@@ -254,6 +274,77 @@ def _prune_inmem(store: dict):
             break
         if store[tid].get("status") in ("done", "failed", "stopped") and tid not in running_tasks:
             store.pop(tid, None)
+
+
+# 运行中日志增量落库的最小间隔（秒）：既保证进程被强杀时日志不丢，又避免每步都写库
+_PERSIST_INTERVAL = 5.0
+
+
+def _make_persist_throttle(kind: str, task_id: str, keyword_id: int,
+                           keyword_name: str, started_at: str):
+    """
+    返回 (persist_now, force_persist) 两个闭包。
+    persist_now：在 on_step 里按节流间隔调用，把当前 steps/stats 快照写回 ai_tasks；
+    force_persist：任务收尾时调用，绕过节流强制落最终状态。
+    这样即使进程被 kill / 热重载打断，日志也已落库，不会「凭空消失」。
+    """
+    state = {"last": 0.0}
+
+    def _write(status: str, progress: dict, finished: bool):
+        db.save_ai_task(
+            task_id=task_id, kind=kind,
+            keyword_id=keyword_id, keyword_name=keyword_name,
+            status=status, stats=progress["stats"], steps=progress["steps"],
+            started_at=started_at,
+            finished_at=datetime.now().isoformat() if finished else None,
+        )
+
+    def persist_now(progress: dict):
+        now = time.monotonic()
+        if now - state["last"] < _PERSIST_INTERVAL:
+            return
+        state["last"] = now
+        try:
+            _write(progress["status"], progress, finished=False)
+        except Exception as e:
+            logger.warning(f"{kind} 任务运行中落库失败: {e}")
+
+    def force_persist(progress: dict):
+        try:
+            _write(progress["status"], progress, finished=True)
+        except Exception as e:
+            logger.warning(f"{kind} 任务收尾落库失败: {e}")
+
+    return persist_now, force_persist
+
+
+def _ai_row_to_progress(row: dict) -> dict:
+    """把 ai_tasks 记录还原成前端进度接口的结构（服务重启后回看日志用）"""
+    return {
+        "task_id": row.get("task_id"),
+        "keyword": row.get("keyword_name"),
+        "status": row.get("status"),
+        "steps": row.get("steps") or [],
+        "stats": row.get("stats") or {},
+    }
+
+
+def _active_tasks(running: dict, status_store: dict) -> list[dict]:
+    """仍在运行的任务摘要，前端刷新页面后可恢复进度条与日志"""
+    out = []
+    for tid, task in running.items():
+        if task.done():
+            continue
+        p = status_store.get(tid)
+        if not p:
+            continue
+        out.append({
+            "task_id": tid,
+            "keyword": p.get("keyword"),
+            "status": p.get("status"),
+            "steps_count": len(p.get("steps") or []),
+        })
+    return out
 
 
 @app.post("/api/crawl")
@@ -577,12 +668,56 @@ async def api_clear_proxy():
 # ============ 爬取任务历史 ============
 
 @app.get("/tasks", response_class=HTMLResponse)
-async def tasks_page(request: Request):
-    """历史任务列表页面"""
-    tasks = db.list_crawl_tasks(limit=100)
+async def tasks_page(request: Request, type: str = "all"):
+    """任务日志：爬取 / 清洗 / 答题三类合并，按开始时间倒序，?type= 筛选"""
+    kind = type if type in ("crawl", "clean", "answer") else "all"
+
+    items: list[dict] = []
+    crawl_tasks = db.list_crawl_tasks(limit=100)
+    ai_tasks = db.list_ai_tasks(limit=100)
+
+    for t in crawl_tasks:
+        steps = t.get("steps") or []
+        items.append({
+            "task_id": t["task_id"],
+            "kind": "crawl",
+            "name": t["query"],
+            "status": t["status"],
+            "stats": t.get("stats") or {},
+            "result": t.get("result"),
+            "steps": steps,
+            "steps_count": t.get("steps_count", len(steps)),
+            "started_at": t["started_at"],
+            "finished_at": t.get("finished_at"),
+        })
+    for t in ai_tasks:
+        steps = t.get("steps") or []
+        items.append({
+            "task_id": t["task_id"],
+            "kind": t["kind"],
+            "name": t["keyword_name"],
+            "status": t["status"],
+            "stats": t.get("stats") or {},
+            "result": None,
+            "steps": steps,
+            "steps_count": t.get("steps_count", len(steps)),
+            "started_at": t["started_at"],
+            "finished_at": t.get("finished_at"),
+        })
+
+    items.sort(key=lambda x: x["started_at"] or "", reverse=True)
+    counts = {
+        "all": len(crawl_tasks) + len(ai_tasks),
+        "crawl": len(crawl_tasks),
+        "clean": sum(1 for t in ai_tasks if t["kind"] == "clean"),
+        "answer": sum(1 for t in ai_tasks if t["kind"] == "answer"),
+    }
+    if kind != "all":
+        items = [x for x in items if x["kind"] == kind]
+
     return templates.TemplateResponse(
         request, "tasks.html",
-        {"tasks": tasks},
+        {"tasks": items, "active_kind": kind, "counts": counts},
     )
 
 
@@ -593,22 +728,38 @@ async def api_list_tasks(limit: int = 50):
 
 @app.get("/api/tasks/{task_id}")
 async def api_get_task(task_id: str):
+    # clean_/answer_ 前缀的任务查 ai_tasks，其余按爬取任务处理
+    if task_id.startswith(("clean_", "answer_")):
+        task = db.get_ai_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        task["name"] = task.get("keyword_name")
+        return task
     task = db.get_crawl_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    task["kind"] = "crawl"
+    task["name"] = task.get("query")
     return task
 
 
 @app.delete("/api/tasks/{task_id}")
 async def api_delete_task(task_id: str):
-    db.delete_crawl_task(task_id)
+    if task_id.startswith(("clean_", "answer_")):
+        db.delete_ai_task(task_id)
+    else:
+        db.delete_crawl_task(task_id)
     return {"message": "已删除"}
 
 
 @app.delete("/api/tasks")
-async def api_clear_tasks():
-    db.clear_all_crawl_tasks()
-    return {"message": "已清空全部任务日志"}
+async def api_clear_tasks(type: str = "all"):
+    """清空任务日志：?type=all（默认，含三类）/ crawl / clean / answer"""
+    if type in ("all", "crawl"):
+        db.clear_all_crawl_tasks()
+    if type in ("all", "clean", "answer"):
+        db.clear_ai_tasks(None if type == "all" else type)
+    return {"message": "已清空任务日志"}
 
 
 # ============ 数据清洗（大模型） ============
@@ -662,25 +813,69 @@ async def clean_archive_page(request: Request, keyword_id: Optional[int] = None,
 
 @app.get("/api/llm/config")
 async def api_get_llm_config():
-    return llm_config.get_status()
+    """返回全部渠道（脱敏）与当前激活渠道 id"""
+    return llm_config.list_status()
 
 
 @app.post("/api/llm/config")
 async def api_save_llm_config(data: LLMConfigUpdate):
+    """新增渠道（id 为空）或更新指定渠道"""
     if not data.base_url.strip() or not data.model.strip():
         raise HTTPException(status_code=400, detail="base_url 和模型名不能为空")
-    if not data.api_key and not llm_config.load_config().get("api_key"):
-        raise HTTPException(status_code=400, detail="首次配置必须填写 API Key")
-    llm_config.save_config(data.base_url, data.api_key or "", data.model)
-    return {"message": "✓ 大模型配置已保存", "status": llm_config.get_status()}
+
+    is_new = not data.id
+    existing = llm_config.get_config_by_id(data.id) if data.id else None
+    if data.id and existing is None:
+        raise HTTPException(status_code=404, detail="渠道不存在")
+    # 新增渠道或渠道原本没有 key 时，必须提交 API Key
+    if (is_new or not (existing and existing.get("api_key"))) and not (data.api_key or "").strip():
+        raise HTTPException(status_code=400, detail="请填写 API Key")
+
+    if data.protocol and data.protocol.strip().lower() not in llm_config.PROTOCOLS:
+        raise HTTPException(status_code=400, detail="协议仅支持 openai / anthropic")
+    status = llm_config.upsert_config(
+        data.base_url, data.model, data.api_key or "",
+        channel_id=data.id, name=data.name,
+        protocol=data.protocol, activate=data.activate,
+    )
+    msg = "✓ 渠道已新增" if is_new else "✓ 渠道已更新"
+    if data.activate:
+        msg += "，并已切换为当前渠道"
+    return {"message": msg, "status": status}
+
+
+@app.post("/api/llm/activate")
+async def api_activate_llm(data: LLMActivate):
+    try:
+        status = llm_config.activate_config(data.id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="渠道不存在")
+    return {"message": "✓ 已切换当前渠道", "status": status}
+
+
+@app.delete("/api/llm/config/{channel_id}")
+async def api_delete_llm_config(channel_id: str):
+    try:
+        status = llm_config.delete_config(channel_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="渠道不存在")
+    return {"message": "✓ 渠道已删除", "status": status}
 
 
 @app.post("/api/llm/test")
-async def api_test_llm():
-    if not ai_llm.is_configured():
+async def api_test_llm(data: Optional[LLMTestRequest] = None):
+    """测试连通性：带 id 测指定渠道，否则测当前激活渠道"""
+    cfg = None
+    if data and data.id:
+        cfg = llm_config.get_config_by_id(data.id)
+        if cfg is None:
+            raise HTTPException(status_code=404, detail="渠道不存在")
+    elif not ai_llm.is_configured():
         return {"ok": False, "message": "请先完整配置 base_url / API Key / 模型"}
+    if cfg and not (cfg["base_url"] and cfg.get("api_key") and cfg["model"]):
+        return {"ok": False, "message": "该渠道信息不完整，请补全后再测试"}
     try:
-        result = await ai_llm.ping()
+        result = await ai_llm.ping(cfg)
         return {"ok": True, "message": f"连接成功，模型回复：{result['reply']}"}
     except Exception as e:
         return {"ok": False, "message": str(e)[:150]}
@@ -698,6 +893,7 @@ async def api_start_clean(req: CleanRequest):
         raise HTTPException(status_code=409, detail="该关键词正在清洗中，请勿重复启动")
 
     task_id = f"clean_{uuid.uuid4().hex[:16]}"
+    started_at = datetime.now().isoformat()
     progress = {
         "task_id": task_id,
         "keyword": keyword["name"],
@@ -707,6 +903,9 @@ async def api_start_clean(req: CleanRequest):
     }
     clean_status[task_id] = progress
     _prune_inmem(clean_status)
+    persist_now, force_persist = _make_persist_throttle(
+        "clean", task_id, keyword["id"], keyword["name"], started_at
+    )
 
     async def run():
         def on_step(step: dict):
@@ -717,6 +916,8 @@ async def api_start_clean(req: CleanRequest):
                 v = step.get("extra", {}).get(k)
                 if isinstance(v, int):
                     progress["stats"][k] = v
+            # 运行中定期落库：进程被强杀/热重载时日志不再丢失
+            persist_now(progress)
 
         stop_event = clean_events[task_id]
         try:
@@ -727,6 +928,25 @@ async def api_start_clean(req: CleanRequest):
             progress["stats"] = {"total": stats["total"], **{k: stats[k] for k in ("cleaned", "irrelevant", "failed")}}
             last = progress["steps"][-1] if progress["steps"] else {}
             progress["status"] = "stopped" if last.get("extra", {}).get("stopped") else "done"
+        except asyncio.CancelledError:
+            # 用户点停止与服务重启都会 cancel：用 stop_event 区分两者
+            if stop_event.is_set():
+                progress["status"] = "stopped"
+                progress["steps"].append({
+                    "step": "done", "phase": "clean", "status": "stopped",
+                    "message": "⏹️ 已停止（已处理的面经保留，未处理的下次继续）",
+                    "current": 0, "total": progress["stats"].get("total", 0),
+                    "extra": {"stopped": True},
+                })
+            else:
+                progress["status"] = "interrupted"
+                progress["steps"].append({
+                    "step": "interrupted", "phase": "clean", "status": "skipped",
+                    "message": "⚠️ 任务被中断（服务停止或重启），已处理的面经保留，未处理的下次继续",
+                    "current": 0, "total": progress["stats"].get("total", 0), "extra": {},
+                })
+            force_persist(progress)
+            raise
         except Exception as e:
             logger.exception("清洗任务失败")
             progress["status"] = "failed"
@@ -735,22 +955,49 @@ async def api_start_clean(req: CleanRequest):
                 "message": f"❌ {str(e)[:120]}", "current": 0, "total": 0, "extra": {},
             })
         finally:
+            # cancel 打断模型请求时循环内的 stopped 分支来不及执行，这里兜底状态
+            if progress["status"] == "running":
+                progress["status"] = "stopped" if stop_event.is_set() else "failed"
+                if stop_event.is_set():
+                    progress["steps"].append({
+                        "step": "done", "phase": "clean", "status": "stopped",
+                        "message": "⏹️ 已停止（已处理的面经保留，未处理的下次继续）",
+                        "current": 0, "total": progress["stats"].get("total", 0),
+                        "extra": {"stopped": True},
+                    })
             clean_running.pop(task_id, None)
             clean_events.pop(task_id, None)
             cleaning_keywords.discard(keyword["id"])
+            force_persist(progress)
 
     clean_events[task_id] = asyncio.Event()
     cleaning_keywords.add(keyword["id"])
+    db.save_ai_task(
+        task_id=task_id, kind="clean",
+        keyword_id=keyword["id"], keyword_name=keyword["name"],
+        status="running", stats=progress["stats"], steps=[],
+        started_at=started_at, finished_at=None,
+    )
     clean_running[task_id] = asyncio.create_task(run())
     return {"task_id": task_id, "status": "running", "message": "清洗任务已启动"}
+
+
+@app.get("/api/clean/active")
+async def api_clean_active():
+    """当前仍在运行的清洗任务（供页面刷新后恢复日志视图）"""
+    return _active_tasks(clean_running, clean_status)
 
 
 @app.get("/api/clean/{task_id}/progress")
 async def api_clean_progress(task_id: str):
     progress = clean_status.get(task_id)
-    if not progress:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return progress
+    if progress:
+        return progress
+    # 内存态丢失（服务重启/热重载）时回退查库，日志仍可回看
+    row = db.get_ai_task(task_id)
+    if row and row.get("kind") == "clean":
+        return _ai_row_to_progress(row)
+    raise HTTPException(status_code=404, detail="任务不存在")
 
 
 @app.post("/api/clean/{task_id}/stop")
@@ -761,7 +1008,9 @@ async def api_stop_clean(task_id: str):
     ev = clean_events.get(task_id)
     if ev is not None:
         ev.set()
-    return {"message": "正在停止…"}
+    # 置位协作信号 + cancel 立即打断当前模型请求/重试退避
+    task.cancel()
+    return {"message": "正在停止…已清洗的面经会保留"}
 
 
 @app.post("/api/interviews/{interview_id}/clean")
@@ -840,6 +1089,7 @@ async def api_start_answer(req: AnswerRequest):
         raise HTTPException(status_code=409, detail="该关键词正在答题中，请勿重复启动")
 
     task_id = f"answer_{uuid.uuid4().hex[:16]}"
+    started_at = datetime.now().isoformat()
     progress = {
         "task_id": task_id,
         "keyword": keyword["name"],
@@ -849,6 +1099,9 @@ async def api_start_answer(req: AnswerRequest):
     }
     answer_status[task_id] = progress
     _prune_inmem(answer_status)
+    persist_now, force_persist = _make_persist_throttle(
+        "answer", task_id, keyword["id"], keyword["name"], started_at
+    )
 
     async def run():
         def on_step(step: dict):
@@ -859,6 +1112,8 @@ async def api_start_answer(req: AnswerRequest):
                 v = step.get("extra", {}).get(k)
                 if isinstance(v, int):
                     progress["stats"][k] = v
+            # 运行中定期落库：进程被强杀/热重载时日志不再丢失
+            persist_now(progress)
 
         stop_event = answer_events[task_id]
         try:
@@ -872,6 +1127,25 @@ async def api_start_answer(req: AnswerRequest):
             }
             last = progress["steps"][-1] if progress["steps"] else {}
             progress["status"] = "stopped" if last.get("extra", {}).get("stopped") else "done"
+        except asyncio.CancelledError:
+            # 用户点停止与服务重启都会 cancel：用 stop_event 区分两者
+            if stop_event.is_set():
+                progress["status"] = "stopped"
+                progress["steps"].append({
+                    "step": "done", "phase": "answer", "status": "stopped",
+                    "message": "⏹️ 已停止（已生成的答案保留，未处理的下次继续）",
+                    "current": 0, "total": progress["stats"].get("total", 0),
+                    "extra": {"stopped": True},
+                })
+            else:
+                progress["status"] = "interrupted"
+                progress["steps"].append({
+                    "step": "interrupted", "phase": "answer", "status": "skipped",
+                    "message": "⚠️ 任务被中断（服务停止或重启），已生成的答案保留，未处理的下次继续",
+                    "current": 0, "total": progress["stats"].get("total", 0), "extra": {},
+                })
+            force_persist(progress)
+            raise
         except Exception as e:
             logger.exception("AI 答题任务失败")
             progress["status"] = "failed"
@@ -880,22 +1154,49 @@ async def api_start_answer(req: AnswerRequest):
                 "message": f"❌ {str(e)[:120]}", "current": 0, "total": 0, "extra": {},
             })
         finally:
+            # cancel 打断模型请求时循环内的 stopped 分支来不及执行，这里兜底状态
+            if progress["status"] == "running":
+                progress["status"] = "stopped" if stop_event.is_set() else "failed"
+                if stop_event.is_set():
+                    progress["steps"].append({
+                        "step": "done", "phase": "answer", "status": "stopped",
+                        "message": "⏹️ 已停止（已生成的答案保留，未处理的下次继续）",
+                        "current": 0, "total": progress["stats"].get("total", 0),
+                        "extra": {"stopped": True},
+                    })
             answer_running.pop(task_id, None)
             answer_events.pop(task_id, None)
             answering_keywords.discard(keyword["id"])
+            force_persist(progress)
 
     answer_events[task_id] = asyncio.Event()
     answering_keywords.add(keyword["id"])
+    db.save_ai_task(
+        task_id=task_id, kind="answer",
+        keyword_id=keyword["id"], keyword_name=keyword["name"],
+        status="running", stats=progress["stats"], steps=[],
+        started_at=started_at, finished_at=None,
+    )
     answer_running[task_id] = asyncio.create_task(run())
     return {"task_id": task_id, "status": "running", "message": "AI 答题任务已启动"}
+
+
+@app.get("/api/answer/active")
+async def api_answer_active():
+    """当前仍在运行的答题任务（供页面刷新后恢复日志视图）"""
+    return _active_tasks(answer_running, answer_status)
 
 
 @app.get("/api/answer/{task_id}/progress")
 async def api_answer_progress(task_id: str):
     progress = answer_status.get(task_id)
-    if not progress:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return progress
+    if progress:
+        return progress
+    # 内存态丢失（服务重启/热重载）时回退查库，日志仍可回看
+    row = db.get_ai_task(task_id)
+    if row and row.get("kind") == "answer":
+        return _ai_row_to_progress(row)
+    raise HTTPException(status_code=404, detail="任务不存在")
 
 
 @app.post("/api/answer/{task_id}/stop")
@@ -906,4 +1207,6 @@ async def api_stop_answer(task_id: str):
     ev = answer_events.get(task_id)
     if ev is not None:
         ev.set()
-    return {"message": "正在停止…"}
+    # 置位协作信号 + cancel 立即打断当前模型请求/重试退避
+    task.cancel()
+    return {"message": "正在停止…已生成的答案会保留"}

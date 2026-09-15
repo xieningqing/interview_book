@@ -1,19 +1,31 @@
 {% extends "base.html" %}
-{% block title %}爬取日志 · 面经猎手{% endblock %}
+{% block title %}任务日志 · 面经猎手{% endblock %}
 
 {% block content %}
 
 <div class="page-head">
     <div>
-        <h1 class="page-title">爬取日志</h1>
-        <p class="page-sub">共 {{ tasks|length }} 条任务记录</p>
+        <h1 class="page-title">任务日志</h1>
+        <p class="page-sub">共 {{ counts.all }} 条任务记录</p>
     </div>
     {% if tasks %}
     <button class="btn btn-sm btn-danger" onclick="clearAll()">
-        <svg class="icon"><use href="#i-trash"/></svg><span>清空全部日志</span>
+        <svg class="icon"><use href="#i-trash"/></svg><span>清空当前列表</span>
     </button>
     {% endif %}
 </div>
+
+{% set tabs = [
+    ('all', '全部', counts.all),
+    ('crawl', '爬取', counts.crawl),
+    ('clean', '清洗', counts.clean),
+    ('answer', '答题', counts.answer)
+] %}
+<nav class="task-tabs">
+    {% for key, label, n in tabs %}
+    <a class="task-tab{% if active_kind == key %} active{% endif %}" href="/tasks?type={{ key }}">{{ label }}<span class="task-tab-count">{{ n }}</span></a>
+    {% endfor %}
+</nav>
 
 {% if tasks %}
 <div class="card" style="padding:0;border:none;background:none;">
@@ -22,13 +34,12 @@
             <thead>
                 <tr>
                     <th style="width:150px;">任务 ID</th>
+                    <th style="width:72px;">类型</th>
                     <th>关键词</th>
-                    <th style="width:90px;">状态</th>
-                    <th style="width:70px;">步骤</th>
-                    <th style="width:60px;">成功</th>
-                    <th style="width:60px;">失败</th>
-                    <th style="width:60px;">风控</th>
-                    <th style="width:160px;">开始时间</th>
+                    <th style="width:80px;">状态</th>
+                    <th style="width:60px;">步骤</th>
+                    <th style="width:200px;">统计</th>
+                    <th style="width:150px;">开始时间</th>
                     <th class="col-actions">操作</th>
                 </tr>
             </thead>
@@ -42,7 +53,16 @@
                             <div style="padding-top:6px;word-break:break-all;">{{ t.task_id }}</div>
                         </details>
                     </td>
-                    <td><strong>{{ t.query }}</strong></td>
+                    <td>
+                        {% if t.kind == 'crawl' %}
+                        <span class="kind-badge kind-crawl"><svg class="icon"><use href="#i-download"/></svg>爬取</span>
+                        {% elif t.kind == 'clean' %}
+                        <span class="kind-badge kind-clean"><svg class="icon"><use href="#i-wand"/></svg>清洗</span>
+                        {% else %}
+                        <span class="kind-badge kind-answer"><svg class="icon"><use href="#i-book"/></svg>答题</span>
+                        {% endif %}
+                    </td>
+                    <td><strong>{{ t.name }}</strong></td>
                     <td>
                         {% if t.status == 'done' %}
                         <span class="status-badge b-ok"><svg class="icon"><use href="#i-check"/></svg>完成</span>
@@ -54,14 +74,28 @@
                         <span class="status-badge b-info"><svg class="icon"><use href="#i-activity"/></svg>进行中</span>
                         {% elif t.status == 'stopped' %}
                         <span class="status-badge b-stop"><svg class="icon"><use href="#i-stop"/></svg>已停止</span>
+                        {% elif t.status == 'interrupted' %}
+                        <span class="status-badge b-risk"><svg class="icon"><use href="#i-alert"/></svg>已中断</span>
                         {% else %}
                         <span class="status-badge b-info">{{ t.status }}</span>
                         {% endif %}
                     </td>
                     <td class="mono muted">{{ t.steps_count if t.steps_count is defined else (t.steps|length if t.steps else 0) }}</td>
-                    <td class="mono text-green">{{ stats.detail_success or 0 }}</td>
-                    <td class="mono text-red">{{ stats.detail_failed or 0 }}</td>
-                    <td class="mono text-orange">{{ stats.risk_hits or 0 }}</td>
+                    <td class="task-stats-cell">
+                        {% if t.kind == 'crawl' %}
+                        <span class="text-green">成功 {{ stats.detail_success or 0 }}</span>
+                        <span class="text-orange">风控 {{ stats.risk_hits or 0 }}</span>
+                        <span class="text-red">失败 {{ stats.detail_failed or 0 }}</span>
+                        {% elif t.kind == 'clean' %}
+                        <span class="text-green">已清洗 {{ stats.cleaned or 0 }}</span>
+                        <span class="text-orange">不相关 {{ stats.irrelevant or 0 }}</span>
+                        <span class="text-red">失败 {{ stats.failed or 0 }}</span>
+                        {% else %}
+                        <span class="text-green">已答 {{ stats.answered or 0 }} 篇</span>
+                        <span>{{ stats.questions or 0 }} 题</span>
+                        <span class="text-red">失败 {{ stats.failed or 0 }}</span>
+                        {% endif %}
+                    </td>
                     <td class="mono muted" style="font-size:12px;">{{ t.started_at[:19]|replace('T', ' ') if t.started_at else '—' }}</td>
                     <td class="col-actions">
                         <div class="btn-group">
@@ -84,11 +118,8 @@
     <div class="empty-badge">
         <svg class="icon"><use href="#i-activity"/></svg>
     </div>
-    <div class="empty-title">暂无爬取记录</div>
-    <div class="empty-sub">完成一次爬取任务后，执行状态与完整请求日志将自动归档并显示在这里</div>
-    <a href="/" class="btn btn-primary btn-sm empty-action">
-        <svg class="icon"><use href="#i-zap"/></svg><span>前往发起爬取</span>
-    </a>
+    <div class="empty-title">暂无{{ '相关' if active_kind != 'all' else '' }}任务记录</div>
+    <div class="empty-sub">爬取、数据清洗、AI 答题任务完成后，执行状态与完整日志会自动归档并显示在这里，服务重启也不会丢失</div>
 </div>
 {% endif %}
 
@@ -114,11 +145,21 @@ const STATUS_ICON = {
     success: '#i-check', failed: '#i-x-circle',
     skipped: '#i-skip', risk: '#i-alert',
 };
+const ACTIVE_KIND = '{{ active_kind }}';
 
 function esc(text) {
     const d = document.createElement('div');
     d.textContent = text == null ? '' : String(text);
     return d.innerHTML;
+}
+
+function appendLine(box, k, v) {
+    const p = document.createElement('p');
+    const strong = document.createElement('strong');
+    strong.textContent = k + '：';
+    p.appendChild(strong);
+    p.appendChild(document.createTextNode(v));
+    box.appendChild(p);
 }
 
 async function viewTask(taskId) {
@@ -127,34 +168,37 @@ async function viewTask(taskId) {
     const task = await resp.json();
     const stats = task.stats || {};
     const result = task.result || {};
+    const kind = task.kind || (taskId.startsWith('clean_') ? 'clean'
+                   : taskId.startsWith('answer_') ? 'answer' : 'crawl');
+    const kindLabel = {crawl: '爬取', clean: '清洗', answer: '答题'}[kind] || '任务';
 
-    document.getElementById('modal-title').textContent = `任务 ${task.query || taskId}`;
-
+    document.getElementById('modal-title').textContent = `${kindLabel}任务 · ${task.name || taskId}`;
     const box = document.getElementById('modal-body');
     box.innerHTML = '';
 
-    // 汇总
     const summary = document.createElement('div');
     summary.className = 'task-summary';
-    const lines = [
-        ['关键词', task.query || '—'],
-        ['时间', `${(task.started_at || '').slice(0, 19)} → ${(task.finished_at || '').slice(0, 19) || '—'}`],
-        ['状态', task.status],
-        ['搜索页数 / 抓取目标', `${stats.search_pages || 0} / ${stats.detail_total || 0}`],
-        ['成功 / 失败 / 风控',
-         `${stats.detail_success || 0} / ${stats.detail_failed || 0} / ${stats.risk_hits || 0}`],
-        ['入库结果', `新增 ${result.new_saved || 0} 篇 · 已存在 ${result.already_exists || 0} 篇`
-            + (result.dup_titles ? ` · 重复标题 ${result.dup_titles} 篇` : '')
-            + ` · TXT ${result.txt_saved || 0}`],
-    ];
-    lines.forEach(([k, v]) => {
-        const p = document.createElement('p');
-        const strong = document.createElement('strong');
-        strong.textContent = k + '：';
-        p.appendChild(strong);
-        p.appendChild(document.createTextNode(v));
-        summary.appendChild(p);
-    });
+    appendLine(summary, '关键词', task.name || task.query || '—');
+    appendLine(summary, '时间',
+        `${(task.started_at || '').slice(0, 19)} → ${(task.finished_at || '').slice(0, 19) || '—'}`);
+    appendLine(summary, '状态', task.status);
+
+    if (kind === 'crawl') {
+        appendLine(summary, '搜索页数 / 抓取目标',
+            `${stats.search_pages || 0} / ${stats.detail_total || 0}`);
+        appendLine(summary, '成功 / 失败 / 风控',
+            `${stats.detail_success || 0} / ${stats.detail_failed || 0} / ${stats.risk_hits || 0}`);
+        appendLine(summary, '入库结果',
+            `新增 ${result.new_saved || 0} 篇 · 已存在 ${result.already_exists || 0} 篇`
+            + (result.dup_titles ? ` · 重复标题 ${result.dup_titles} 篇` : ''));
+    } else if (kind === 'clean') {
+        appendLine(summary, '待处理 / 已清洗 / 不相关 / 失败',
+            `${stats.total || 0} / ${stats.cleaned || 0} / ${stats.irrelevant || 0} / ${stats.failed || 0}`);
+    } else {
+        appendLine(summary, '待处理 / 已答题 / 生成答案 / 失败',
+            `${stats.total || 0} / ${stats.answered || 0} 篇 / ${stats.questions || 0} 题 / ${stats.failed || 0}`);
+        if (stats.skipped) appendLine(summary, '跳过（无标准答案题）', `${stats.skipped} 题`);
+    }
     box.appendChild(summary);
 
     // 日志
@@ -163,7 +207,7 @@ async function viewTask(taskId) {
         const title = document.createElement('div');
         title.className = 'log-title';
         title.innerHTML = `<svg class="icon"><use href="#i-terminal"/></svg>`;
-        title.appendChild(document.createTextNode(`完整请求日志 · ${steps.length} 条`));
+        title.appendChild(document.createTextNode(`完整日志 · ${steps.length} 条`));
         box.appendChild(title);
 
         const list = document.createElement('div');
@@ -172,7 +216,7 @@ async function viewTask(taskId) {
             const row = document.createElement('div');
             row.className = `req-row req-${step.status || 'info'}`;
             row.innerHTML =
-                `<span class="req-phase">${step.phase || '—'}</span>` +
+                `<span class="req-phase">${esc(step.phase || '—')}</span>` +
                 `<span class="req-status"><svg class="icon"><use href="${STATUS_ICON[step.status] || '#i-info'}"/></svg></span>` +
                 `<span class="req-msg">${esc(step.message)}</span>`;
             list.appendChild(row);
@@ -194,7 +238,7 @@ document.addEventListener('keydown', e => {
 async function deleteTask(taskId) {
     const go = await uiConfirm({
         title: '删除任务记录',
-        message: '确定删除此任务记录？',
+        message: '确定删除此任务记录？不影响已入库的面经数据。',
         okText: '删除', danger: true, iconHref: '#i-trash',
     });
     if (!go) return;
@@ -203,13 +247,15 @@ async function deleteTask(taskId) {
 }
 
 async function clearAll() {
+    const scope = ACTIVE_KIND === 'all' ? '全部三类（爬取/清洗/答题）'
+        : ({crawl: '爬取', clean: '清洗', answer: '答题'}[ACTIVE_KIND]) + '类型';
     const go = await uiConfirm({
-        title: '清空历史日志',
-        message: '确定清空全部爬取历史日志？此操作不可恢复。',
+        title: '清空任务日志',
+        message: `确定清空${scope}的历史日志？此操作不可恢复，不影响已入库数据。`,
         okText: '全部清空', danger: true, iconHref: '#i-trash',
     });
     if (!go) return;
-    await fetch('/api/tasks', { method: 'DELETE' });
+    await fetch(`/api/tasks?type=${ACTIVE_KIND}`, { method: 'DELETE' });
     location.reload();
 }
 </script>

@@ -861,6 +861,62 @@ label { font-size: 13px; color: var(--tx-2); }
 .text-yellow { color: var(--warn); }
 .text-orange { color: var(--orange); }
 
+/* ============ 任务日志：类型 Tab 与徽章 ============ */
+.task-tabs {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+}
+.task-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    color: var(--tx-3);
+    background: var(--bg-2);
+    border: 1px solid var(--bd-0);
+    border-radius: 999px;
+    transition: border-color .15s, color .15s;
+}
+.task-tab:hover { color: var(--ac); border-color: var(--ac-bd); text-decoration: none; }
+.task-tab.active {
+    color: var(--ac);
+    background: var(--ac-bg);
+    border-color: var(--ac-bd);
+    font-weight: 600;
+}
+.task-tab-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--tx-4);
+}
+.task-tab.active .task-tab-count { color: var(--ac); }
+.kind-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px 8px;
+    font-size: 11px;
+    border-radius: 999px;
+    border: 1px solid var(--bd-0);
+    white-space: nowrap;
+}
+.kind-badge .icon { width: 11px; height: 11px; }
+.kind-crawl { color: var(--info); background: var(--info-bg); border-color: rgba(var(--info-rgb),0.3); }
+.kind-clean { color: var(--purple); background: var(--purple-bg); border-color: rgba(var(--purple-rgb),0.26); }
+.kind-answer { color: var(--ac); background: var(--ac-bg); border-color: var(--ac-bd); }
+.task-stats-cell {
+    font-size: 12px;
+    white-space: nowrap;
+}
+.task-stats-cell span {
+    display: inline-block;
+    margin-right: 8px;
+    font-family: var(--mono);
+}
+
 /* ============ 任务详情 ============ */
 .task-summary {
     background: var(--bg-3);
@@ -1073,6 +1129,89 @@ label { font-size: 13px; color: var(--tx-2); }
     color: var(--ac);
     font-weight: 600;
 }
+
+/* ============ 大模型多渠道列表 ============ */
+.chan-list { display: flex; flex-direction: column; gap: 8px; }
+.chan-empty {
+    padding: 14px 16px;
+    font-size: 13px;
+    color: var(--tx-4);
+    border: 1px dashed var(--bd-0);
+    border-radius: var(--r-sm);
+    text-align: center;
+}
+.chan-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border: 1px solid var(--bd-0);
+    border-radius: var(--r-sm);
+    background: var(--bg-2);
+}
+.chan-item.active {
+    border-color: var(--ac-bd);
+    background: var(--ac-bg);
+}
+.chan-radio {
+    flex: none;
+    width: 16px; height: 16px;
+    padding: 0;
+    border-radius: 50%;
+    border: 2px solid var(--tx-4);
+    background: transparent;
+    cursor: pointer;
+    position: relative;
+}
+.chan-item.active .chan-radio { border-color: var(--ac); }
+.chan-radio span {
+    position: absolute;
+    inset: 2px;
+    border-radius: 50%;
+    background: transparent;
+}
+.chan-item.active .chan-radio span { background: var(--ac); }
+.chan-main { flex: 1; min-width: 0; }
+.chan-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--tx-1);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.chan-tag {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ac);
+    border: 1px solid var(--ac-bd);
+    border-radius: 999px;
+    padding: 0 7px;
+    line-height: 16px;
+}
+.chan-meta {
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--tx-3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.chan-meta em { color: var(--warn); font-style: normal; }
+.proto-tag {
+    display: inline-block;
+    margin-right: 6px;
+    font-size: 11px;
+    color: var(--purple);
+    background: var(--purple-bg);
+    border: 1px solid rgba(var(--purple-rgb), 0.34);
+    border-radius: 4px;
+    padding: 0 5px;
+    line-height: 15px;
+    vertical-align: 1px;
+}
+.chan-actions { flex: none; display: flex; gap: 4px; align-items: center; }
+.chan-toolbar { margin-top: 10px; }
 
 /* ============ 折叠面板 ============ */
 .collapsible-head {

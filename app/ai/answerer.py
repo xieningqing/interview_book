@@ -12,10 +12,13 @@ import re
 from typing import Optional
 
 from app.ai import llm
-from app.ai.cleaner import _extract_json, _tidy_text
+from app.ai.cleaner import _tidy_text
 from app.storage import database as db
 
 logger = logging.getLogger(__name__)
+
+# 并发答题数：并行调用大模型加快批量处理；过大易触发限流，2 为稳妥值
+CONCURRENCY = 2
 
 SYSTEM_PROMPT = """你是资深技术面试考官，负责为面经中的面试题写「参考答案」。
 
@@ -79,10 +82,7 @@ async def answer_interview(interview: dict, keyword_name: str) -> dict:
         lines.append(f"{i}. 问：{item['question']}\n   原回答：{raw_a[:500]}")
     user_prompt = "\n".join(lines)
 
-    raw = await llm.chat(SYSTEM_PROMPT, user_prompt)
-    data = _extract_json(raw)
-    if data is None:
-        raise RuntimeError("模型返回不是合法 JSON")
+    data = await llm.chat_json(SYSTEM_PROMPT, user_prompt)
 
     reply = data.get("answers")
     if not isinstance(reply, list):
@@ -145,33 +145,61 @@ async def answer_batch(
         emit("done", "success", "该关键词下没有待答题的已清洗面经", 0)
         return stats
 
-    for i, inv in enumerate(targets, 1):
-        if stop_event is not None and stop_event.is_set():
-            emit("done", "stopped",
-                 f"⏹️ 已停止：答题 {stats['answered']} 篇，生成 {stats['questions']} 题，失败 {stats['failed']}",
-                 i - 1, {"stopped": True, **stats})
-            return stats
+    # 立即回一条开始事件：首篇模型调用耗时较长，避免前端一直停在「准备中」
+    emit("start", "info",
+         f"🚀 共 {len(targets)} 篇待答题，并发 {CONCURRENCY} 篇调用大模型（失败自动重试）", 0)
 
-        title = (inv.get("title") or "")[:40]
-        try:
-            result = await answer_interview(inv, keyword_name)
-            stats["answered"] += 1
-            stats["questions"] += result["answered"]
-            stats["skipped"] += result["skipped"]
-            emit("answer_item", "success",
-                 f"✅ [{i}/{len(targets)}] 已答题（{result['answered']} 题，跳过 {result['skipped']}）{title}",
-                 i, {"title": title, **result})
-        except Exception as e:
-            stats["failed"] += 1
-            logger.warning(f"AI 答题失败 id={inv['id']}: {e}")
-            emit("answer_item", "failed",
-                 f"❌ [{i}/{len(targets)}] {title} —— {str(e)[:80]}", i,
-                 {"title": title, "error": str(e)[:120]})
+    # 并发执行：信号量限流，各篇完成后计数/发进度；任一篇失败只记该篇失败
+    sem = asyncio.Semaphore(CONCURRENCY)
+    processed = 0
 
-        # 请求间留出间隔，降低限流概率
-        await asyncio.sleep(0.5)
+    async def work(inv):
+        nonlocal processed
+        async with sem:
+            title = (inv.get("title") or "")[:40]
+            # 模型返回前先告知当前处理项，单篇耗时长时界面不会像卡住
+            emit("answer_item", "info", f"⏳ 正在答题 {title}", processed)
+            try:
+                result = await answer_interview(inv, keyword_name)
+            except Exception as e:
+                # asyncio.CancelledError 是 BaseException，不会被这里捕获，取消正常传播
+                stats["failed"] += 1
+                logger.warning(f"AI 答题失败 id={inv['id']}: {e}")
+                processed += 1
+                emit("answer_item", "failed",
+                     f"❌ {title} —— {str(e)[:80]}", processed,
+                     {"title": title, "error": str(e)[:120], **stats})
+            else:
+                stats["answered"] += 1
+                stats["questions"] += result["answered"]
+                stats["skipped"] += result["skipped"]
+                processed += 1
+                emit("answer_item", "success",
+                     f"✅ 已答题（{result['answered']} 题，跳过 {result['skipped']}）{title}", processed,
+                     {"title": title, **stats})
+            # 请求间留出间隔，降低限流概率（任务被取消时 sleep 抛 CancelledError 向上传播）
+            await asyncio.sleep(0.3)
+
+    pending = {asyncio.create_task(work(inv)) for inv in targets}
+    try:
+        while pending:
+            if stop_event is not None and stop_event.is_set():
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                emit("done", "stopped",
+                     f"⏹️ 已停止：答题 {stats['answered']} 篇，生成 {stats['questions']} 题，失败 {stats['failed']}",
+                     processed, {"stopped": True, **stats})
+                return stats
+            _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # main.py 停止/重启会 cancel 本任务：取消未完成的子任务后继续抛出
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
 
     emit("done", "success",
          f"🏁 答题完成：{stats['answered']} 篇，生成答案 {stats['questions']} 题，跳过 {stats['skipped']}，失败 {stats['failed']}",
-         len(targets), stats)
+         processed, stats)
     return stats

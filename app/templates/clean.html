@@ -37,7 +37,7 @@
 <div class="card">
     <div class="card-head collapsible-head" id="llm-head" role="button" tabindex="0"
          aria-expanded="false" title="点击配置大模型接口">
-        <div class="card-title"><svg class="icon"><use href="#i-terminal"/></svg>大模型接口（OpenAI 兼容）</div>
+        <div class="card-title"><svg class="icon"><use href="#i-terminal"/></svg>大模型接口（OpenAI / Claude 兼容）</div>
         <span class="collapsible-toggle">
             <span class="card-note" id="llm-state-note">
                 {% if llm_status.configured %}<span class="dot-ok"></span>已配置 · {{ llm_status.model }}{% else %}<span class="dot-off"></span>尚未配置{% endif %}
@@ -49,40 +49,62 @@
         </span>
     </div>
     <div id="llm-body" style="display:none;">
+    <!-- 已保存的渠道列表 -->
+    <div id="chan-list" class="chan-list"></div>
+    <div class="chan-toolbar">
+        <button type="button" id="chan-add-btn" class="btn btn-sm btn-ghost">
+            <svg class="icon"><use href="#i-plus"/></svg><span>新增渠道</span>
+        </button>
+    </div>
+
+    <!-- 新增 / 编辑渠道表单 -->
+    <div id="llm-form-wrap" style="display:none;">
     <div class="vendor-row">
         <span class="vendor-label">快速选择服务商：</span>
         <div class="vendor-chips" id="vendor-chips"></div>
     </div>
     <form id="llm-form" class="form-inline" style="align-items:flex-end;">
+        <div class="form-group" style="min-width:170px;">
+            <label for="llm-name">渠道名称</label>
+            <input type="text" id="llm-name" placeholder="如：公司中转站 / DeepSeek 官方" autocomplete="off">
+        </div>
+        <div class="form-group" style="min-width:130px;">
+            <label for="llm-protocol">接口协议</label>
+            <select id="llm-protocol">
+                <option value="openai">OpenAI 兼容</option>
+                <option value="anthropic">Claude (Anthropic)</option>
+            </select>
+        </div>
         <div class="form-group grow">
             <label for="llm-base-url">Base URL</label>
-            <input type="text" id="llm-base-url" placeholder="点上方服务商自动填入，或手动填写"
-                   value="{{ llm_status.base_url }}" autocomplete="off">
+            <input type="text" id="llm-base-url" placeholder="点上方服务商自动填入，或手动填写" autocomplete="off">
         </div>
         <div class="form-group grow">
             <label for="llm-model">模型名</label>
             <input type="text" id="llm-model" list="llm-model-list"
-                   placeholder="点击右侧箭头选择，或手动输入"
-                   value="{{ llm_status.model }}" autocomplete="off">
+                   placeholder="从下拉选择，或手动输入" autocomplete="off">
             <datalist id="llm-model-list"></datalist>
         </div>
         <div class="form-group grow">
-            <label for="llm-key">API Key {% if llm_status.api_key_masked %}<span class="unit">（已保存 {{ llm_status.api_key_masked }}，留空不修改）</span>{% endif %}</label>
-            <input type="password" id="llm-key" placeholder="{% if llm_status.api_key_masked %}留空保持不变{% else %}sk-...{% endif %}">
+            <label for="llm-key">API Key <span id="llm-key-hint" class="unit"></span></label>
+            <input type="password" id="llm-key" placeholder="sk-...">
         </div>
         <div class="form-actions">
-            <button type="submit" class="btn btn-ghost">
-                <svg class="icon"><use href="#i-save"/></svg><span>保存配置</span>
+            <button type="submit" class="btn btn-ghost" id="llm-save-btn">
+                <svg class="icon"><use href="#i-save"/></svg><span>保存</span>
             </button>
-            <button type="button" id="llm-test-btn" class="btn btn-primary">
-                <svg class="icon"><use href="#i-zap"/></svg><span>测试连接</span>
+            <button type="button" id="llm-save-use-btn" class="btn btn-primary">
+                <svg class="icon"><use href="#i-check"/></svg><span>保存并使用</span>
+            </button>
+            <button type="button" id="llm-cancel-btn" class="btn btn-ghost">
+                <span>取消</span>
             </button>
         </div>
     </form>
     <p class="hint" style="margin-bottom:0;margin-top:10px;">
-        点上方服务商可自动填入接口地址；模型名请自行从下拉选择或手动填写（也兼容 vLLM / Ollama / 网关等任何 OpenAI 格式端点）。
-        API Key 仅保存在本机，不会上传。
+        可保存多个渠道，点渠道行首圆点切换当前使用的渠道；兼容任何 OpenAI 格式端点与 Claude Messages API。API Key 仅保存在本机。
     </p>
+    </div>
     </div>
 </div>
 
@@ -180,10 +202,15 @@
 <script>
 function svg(h){ return `<svg class="icon"><use href="${h}"/></svg>`; }
 let cleanTaskId = null, cleanTimer = null, cleanLast = 0;
-const LLM_CONFIGURED = {{ 'true' if llm_status.configured else 'false' }};
+let LLM_CONFIGURED = {{ 'true' if llm_status.configured else 'false' }};
 
-// ===== 服务商预设（base_url 为 OpenAI 兼容端点）=====
+// ===== 服务商预设（protocol 缺省为 openai，Claude 走 anthropic）=====
 const VENDORS = [
+    {id:'claude', name:'Claude', protocol:'anthropic', base:'https://api.anthropic.com/v1', models:[
+        {v:'claude-sonnet-4-20250514', label:'Claude Sonnet 4 · 均衡（推荐）'},
+        {v:'claude-opus-4-1-20250805', label:'Claude Opus 4.1 · 旗舰'},
+        {v:'claude-haiku-4-5-20251001', label:'Claude Haiku 4.5 · 快速便宜'},
+    ]},
     {id:'deepseek', name:'DeepSeek', base:'https://api.deepseek.com/v1', models:[
         {v:'deepseek-chat', label:'DeepSeek-V3 · 通用对话'},
         {v:'deepseek-reasoner', label:'DeepSeek-R1 · 深度推理'},
@@ -221,6 +248,7 @@ const chipsBox = document.getElementById('vendor-chips');
 const modelList = document.getElementById('llm-model-list');
 const baseInput = document.getElementById('llm-base-url');
 const modelInput = document.getElementById('llm-model');
+const protocolEl = document.getElementById('llm-protocol');
 
 function fillModelOptions(models) {
     modelList.innerHTML = '';
@@ -243,7 +271,11 @@ chipsBox.addEventListener('click', (e) => {
     if (!chip) return;
     const v = VENDORS.find(x => x.id === chip.dataset.vendor);
     baseInput.value = v.base;
+    protocolEl.value = v.protocol || 'openai';
     fillModelOptions(v.models);
+    // 新增渠道且名称为空时，顺带用服务商名占位，用户可改
+    const nameEl = document.getElementById('llm-name');
+    if (nameEl && !nameEl.value.trim()) nameEl.value = v.name;
     // 模型名不自动填、不覆盖已保存值，由用户自行从下拉选择或手动输入
     setActiveChip(v.id);
     if (v.note) showFeed(v.note, 'info');
@@ -275,13 +307,13 @@ setLlmOpen(false);
 async function promptConfig() {
     const go = await uiConfirm({
         title: '需要先配置大模型',
-        message: '尚未配置大模型接口，暂时无法清洗。\n是否现在去配置？（配置只需填一次）',
-        okText: '去配置', cancelText: '取消', iconHref: '#i-wand',
+        message: '尚未配置可用渠道，暂时无法清洗。\n是否现在去添加？（可一次配置多个渠道随时切换）',
+        okText: '去添加', cancelText: '取消', iconHref: '#i-wand',
     });
     if (go) {
         setLlmOpen(true);
         llmHead.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        setTimeout(() => document.getElementById('llm-base-url').focus(), 300);
+        setTimeout(() => openForm(null), 300);
     }
     return go;
 }
@@ -297,32 +329,186 @@ function showFeed(msg, type) {
     _feedTimer = setTimeout(() => _feedEl.classList.add('hidden'), 4000);
 }
 
-// ===== LLM 配置 =====
-document.getElementById('llm-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
+// ===== 多渠道管理 =====
+let llmData = {channels: [], active_id: null, configured: false};
+let editingChanId = null;
+const chanListEl = document.getElementById('chan-list');
+const chanAddBtn = document.getElementById('chan-add-btn');
+const formWrapEl = document.getElementById('llm-form-wrap');
+const nameInputEl = document.getElementById('llm-name');
+const keyInputEl = document.getElementById('llm-key');
+const keyHintEl = document.getElementById('llm-key-hint');
+const saveBtnEl = document.getElementById('llm-save-btn');
+const saveUseBtnEl = document.getElementById('llm-save-use-btn');
+
+function escapeHtml(s) {
+    return (s || '').replace(/[&<>"']/g, c =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function updateHeaderNote() {
+    const note = document.getElementById('llm-state-note');
+    LLM_CONFIGURED = !!llmData.configured;
+    const active = llmData.channels.find(c => c.id === llmData.active_id);
+    if (active) {
+        const dot = llmData.configured ? 'dot-ok' : 'dot-off';
+        const label = llmData.configured ? '已配置' : '信息不完整';
+        note.innerHTML = `<span class="${dot}"></span>${label} · ${escapeHtml(active.name)} · ${escapeHtml(active.model)}`;
+    } else {
+        note.innerHTML = '<span class="dot-off"></span>尚未配置';
+    }
+    llmToggleText.textContent = llmBody.style.display !== 'none'
+        ? '收起' : (LLM_CONFIGURED ? '修改' : '设置');
+}
+
+function renderChannels() {
+    updateHeaderNote();
+    if (!llmData.channels.length) {
+        chanListEl.innerHTML = '<div class="chan-empty">还没有渠道，点「新增渠道」添加</div>';
+        return;
+    }
+    chanListEl.innerHTML = llmData.channels.map(c => `
+        <div class="chan-item ${c.id === llmData.active_id ? 'active' : ''}" data-id="${c.id}">
+            <button type="button" class="chan-radio" title="切换为当前渠道"><span></span></button>
+            <div class="chan-main">
+                <div class="chan-name">${escapeHtml(c.name)}${c.id === llmData.active_id ? '<span class="chan-tag">当前</span>' : ''}</div>
+                <div class="chan-meta">${c.protocol === 'anthropic' ? '<span class="proto-tag">Claude</span>' : ''}${escapeHtml(c.model)} · ${escapeHtml(c.base_url)} · ${c.has_key ? 'Key 已保存' : '<em>未填 Key</em>'}</div>
+            </div>
+            <div class="chan-actions">
+                <button type="button" class="btn btn-sm btn-ghost act-test">
+                    <svg class="icon"><use href="#i-zap"/></svg><span>测试</span>
+                </button>
+                <button type="button" class="btn btn-sm btn-ghost act-edit"><span>编辑</span></button>
+                <button type="button" class="btn btn-sm btn-ghost act-del" title="删除渠道">
+                    <svg class="icon"><use href="#i-trash"/></svg>
+                </button>
+            </div>
+        </div>`).join('');
+}
+
+async function loadChannels() {
+    try {
+        const r = await fetch('/api/llm/config');
+        if (r.ok) { llmData = await r.json(); renderChannels(); }
+    } catch (e) { /* 保持服务端首屏渲染的状态 */ }
+}
+
+function openForm(chan) {
+    editingChanId = chan ? chan.id : null;
+    nameInputEl.value = chan ? chan.name : '';
+    baseInput.value = chan ? chan.base_url : '';
+    modelInput.value = chan ? chan.model : '';
+    keyInputEl.value = '';
+    keyHintEl.textContent = chan && chan.has_key ? `（已保存 ${chan.api_key_masked}，留空不修改）` : '';
+    keyInputEl.placeholder = chan && chan.has_key ? '留空保持不变' : 'sk-...';
+    protocolEl.value = (chan && chan.protocol) || 'openai';
+    saveBtnEl.querySelector('span').textContent = chan ? '保存修改' : '保存';
+    saveUseBtnEl.querySelector('span').textContent = chan ? '保存并使用' : '添加并使用';
+    fillModelOptions([]);
+    setActiveChip(null);
+    formWrapEl.style.display = '';
+    chanAddBtn.style.display = 'none';
+    nameInputEl.focus();
+}
+
+function closeForm() {
+    formWrapEl.style.display = 'none';
+    chanAddBtn.style.display = '';
+    keyInputEl.value = '';
+}
+
+async function submitChannel(activate) {
     const body = {
-        base_url: document.getElementById('llm-base-url').value.trim(),
-        model: document.getElementById('llm-model').value.trim(),
+        base_url: baseInput.value.trim(),
+        model: modelInput.value.trim(),
+        protocol: protocolEl.value,
+        activate: activate,
     };
-    const key = document.getElementById('llm-key').value.trim();
+    const nm = nameInputEl.value.trim();
+    if (nm) body.name = nm;
+    if (editingChanId) body.id = editingChanId;
+    const key = keyInputEl.value.trim();
     if (key) body.api_key = key;
-    const r = await fetch('/api/llm/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+
+    const r = await fetch('/api/llm/config', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+    });
     const d = await r.json();
     if (!r.ok) { showFeed(d.detail || '保存失败', 'error'); return; }
-    showFeed('大模型配置已保存', 'success');
-    setTimeout(() => location.reload(), 1200);
-});
+    llmData = d.status;
+    renderChannels();
+    closeForm();
+    showFeed(d.message, 'success');
+}
 
-document.getElementById('llm-test-btn').addEventListener('click', async () => {
-    const btn = document.getElementById('llm-test-btn');
-    btn.disabled = true; btn.querySelector('span').textContent = '测试中…';
+async function activateChannel(id) {
+    if (id === llmData.active_id) return;
+    const r = await fetch('/api/llm/activate', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id}),
+    });
+    const d = await r.json();
+    if (!r.ok) { showFeed(d.detail || '切换失败', 'error'); return; }
+    llmData = d.status;
+    renderChannels();
+    showFeed(d.message, 'success');
+}
+
+async function deleteChannel(chan) {
+    const go = await uiConfirm({
+        title: '删除渠道',
+        message: `确定删除「${chan.name}」？该操作不可恢复。`,
+        okText: '删除', danger: true, iconHref: '#i-trash',
+    });
+    if (!go) return;
+    const r = await fetch(`/api/llm/config/${encodeURIComponent(chan.id)}`, {method: 'DELETE'});
+    const d = await r.json();
+    if (!r.ok) { showFeed(d.detail || '删除失败', 'error'); return; }
+    llmData = d.status;
+    renderChannels();
+    showFeed(d.message, 'success');
+}
+
+async function testChannel(id, btn) {
+    const span = btn.querySelector('span');
+    const oldText = span.textContent;
+    btn.disabled = true; span.textContent = '测试中…';
     try {
-        const r = await fetch('/api/llm/test', {method:'POST'});
+        const r = await fetch('/api/llm/test', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id}),
+        });
         const d = await r.json();
         showFeed(d.message, d.ok ? 'success' : 'error');
-    } catch(e) { showFeed('测试失败：' + e.message, 'error'); }
-    btn.disabled = false; btn.querySelector('span').textContent = '测试连接';
+    } catch (e) {
+        showFeed('测试失败：' + e.message, 'error');
+    }
+    btn.disabled = false; span.textContent = oldText;
+}
+
+chanAddBtn.addEventListener('click', () => openForm(null));
+document.getElementById('llm-cancel-btn').addEventListener('click', closeForm);
+document.getElementById('llm-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitChannel(false);
 });
+saveUseBtnEl.addEventListener('click', () => submitChannel(true));
+
+// 渠道列表事件委托：圆点切换 / 测试 / 编辑 / 删除
+chanListEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.chan-item');
+    if (!item) return;
+    const chan = llmData.channels.find(c => c.id === item.dataset.id);
+    if (!chan) return;
+    if (e.target.closest('.chan-radio')) return activateChannel(chan.id);
+    const testBtn = e.target.closest('.act-test');
+    if (testBtn) return testChannel(chan.id, testBtn);
+    if (e.target.closest('.act-edit')) return openForm(chan);
+    if (e.target.closest('.act-del')) return deleteChannel(chan);
+});
+
+loadChannels();
 
 // ===== 批量清洗 =====
 document.getElementById('clean-start-btn').addEventListener('click', async () => {
@@ -423,19 +609,22 @@ function pollClean() {
         document.getElementById('clean-text').textContent =
             latest ? latest.message : '准备中…';
 
-        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed') {
+        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed'
+            || data.status === 'interrupted') {
             finishClean('ok');
-            const ok = data.status === 'done';
-            showFeed(ok ? '清洗完成' : (data.status === 'stopped' ? '清洗已停止' : '清洗失败'),
-                     ok ? 'success' : (data.status === 'stopped' ? 'info' : 'error'));
-            if (ok) setTimeout(() => location.reload(), 2000);
+            const msg = data.status === 'done' ? '清洗完成'
+                : data.status === 'stopped' ? '清洗已停止'
+                : data.status === 'interrupted' ? '清洗已中断（日志来自数据库）'
+                : '清洗失败';
+            showFeed(msg, data.status === 'done' ? 'success'
+                       : (data.status === 'failed' ? 'error' : 'info'));
+            if (data.status !== 'failed') setTimeout(() => location.reload(), 1500);
         }
     }).catch(() => {});
 }
 
 // ===== 批量 AI 答题 =====
 let answerTaskId = null, answerTimer = null, answerLast = 0;
-
 document.getElementById('answer-start-btn').addEventListener('click', async () => {
     if (!LLM_CONFIGURED) { promptConfig(); return; }
     const kid = document.getElementById('answer-keyword').value;
@@ -532,14 +721,44 @@ function pollAnswer() {
         document.getElementById('answer-bar').style.width = pct + '%';
         document.getElementById('answer-text').textContent = latest ? latest.message : '准备中…';
 
-        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed') {
+        if (data.status === 'done' || data.status === 'stopped' || data.status === 'failed'
+            || data.status === 'interrupted') {
             finishAnswer('ok');
-            const ok = data.status === 'done';
-            showFeed(ok ? '答题完成' : (data.status === 'stopped' ? '答题已停止' : '答题失败'),
-                     ok ? 'success' : (data.status === 'stopped' ? 'info' : 'error'));
-            if (ok) setTimeout(() => location.reload(), 2000);
+            const msg = data.status === 'done' ? '答题完成'
+                : data.status === 'stopped' ? '答题已停止'
+                : data.status === 'interrupted' ? '答题已中断（日志来自数据库）'
+                : '答题失败';
+            showFeed(msg, data.status === 'done' ? 'success'
+                       : (data.status === 'failed' ? 'error' : 'info'));
+            if (data.status !== 'failed') setTimeout(() => location.reload(), 1500);
         }
     }).catch(() => {});
 }
+
+// ===== 刷新页面后恢复正在运行的任务（日志/进度条不再凭空消失） =====
+function resumeTask(kind) {
+    fetch(`/api/${kind}/active`).then(r => r.ok ? r.json() : []).then(list => {
+        if (!list.length) return;
+        const t = list[0];
+        if (kind === 'clean') {
+            if (cleanTaskId) return;
+            cleanTaskId = t.task_id;
+            document.getElementById('clean-start-btn').style.display = 'none';
+            document.getElementById('clean-stop-btn').style.display = '';
+            if (cleanTimer) clearInterval(cleanTimer);
+            cleanTimer = setInterval(pollClean, 800);
+        } else {
+            if (answerTaskId) return;
+            answerTaskId = t.task_id;
+            document.getElementById('answer-start-btn').style.display = 'none';
+            document.getElementById('answer-stop-btn').style.display = '';
+            if (answerTimer) clearInterval(answerTimer);
+            answerTimer = setInterval(pollAnswer, 800);
+        }
+        showFeed('检测到正在运行的任务，已恢复进度显示', 'info');
+    }).catch(() => {});
+}
+resumeTask('clean');
+resumeTask('answer');
 </script>
 {% endblock %}

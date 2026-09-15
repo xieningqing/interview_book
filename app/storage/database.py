@@ -88,6 +88,22 @@ def init_db():
                 finished_at TEXT,
                 FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ai_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT UNIQUE NOT NULL,
+                kind TEXT NOT NULL,
+                keyword_id INTEGER,
+                keyword_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stats TEXT,
+                steps TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ai_tasks_started ON ai_tasks(started_at);
         """)
         # 旧库平滑升级：补齐后续版本新增的列
         existed = {r[1] for r in conn.execute("PRAGMA table_info(interviews)")}
@@ -199,7 +215,8 @@ def save_interviews(keyword_id: int, interviews: list[dict]) -> tuple[int, list[
     """
     批量保存面经：
     - URL 已存在 → 视为重复爬取，跳过
-    - URL 新但标题（归一化后）已存在或同批次内重复 → 入库并打「重复标题」tag
+    - 同批次内重复标题（同一篇面经被收录多个 URL）→ 跳过，不重复入库
+    - 库中同关键词已有同标题 → 入库并打「重复标题」tag
     返回 (新增数量, 已存在列表, 重复标题数量)
     """
     conn = get_connection()
@@ -208,12 +225,16 @@ def save_interviews(keyword_id: int, interviews: list[dict]) -> tuple[int, list[
     existing = []
 
     try:
-        # 库中已有的归一化标题集合
+        # 库中该关键词下已有的归一化标题集合
         known_titles = set()
-        for r in conn.execute("SELECT title FROM interviews").fetchall():
+        for r in conn.execute(
+            "SELECT title FROM interviews WHERE keyword_id = ?", (keyword_id,)
+        ).fetchall():
             nt = normalize_title(r["title"])
             if nt:
                 known_titles.add(nt)
+        # 本批次内已接收的标题：同一批里重复出现视为同一篇，直接跳过
+        batch_titles = set()
 
         for inv in interviews:
             url = inv.get("url", "")
@@ -226,15 +247,21 @@ def save_interviews(keyword_id: int, interviews: list[dict]) -> tuple[int, list[
                 existing.append({"url": url, "title": title})
                 continue
 
-            # 按标题判重：与库内或本批次已有标题相同则打 tag
-            tags = list(inv.get("tags", []) or [])
             nt = normalize_title(title)
+            if nt and nt in batch_titles:
+                # 同一批次内重复标题：不再入库，避免清洗/答题时同一篇处理两遍
+                dup_count += 1
+                existing.append({"url": url, "title": title})
+                continue
+            if nt:
+                batch_titles.add(nt)
+
+            # 与库内已有同标题相比，属跨批次重复：入库但打 tag
+            tags = list(inv.get("tags", []) or [])
             if nt and nt in known_titles:
                 if "重复标题" not in tags:
                     tags.append("重复标题")
                 dup_count += 1
-            if nt:
-                known_titles.add(nt)
 
             # 插入面经
             conn.execute(
@@ -710,5 +737,141 @@ def clear_all_crawl_tasks():
     try:
         conn.execute("DELETE FROM crawl_tasks")
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ========== AI 任务日志（清洗 / 答题） ==========
+
+def save_ai_task(
+    task_id: str,
+    kind: str,
+    keyword_name: str,
+    status: str,
+    stats: dict,
+    steps: list,
+    started_at: str,
+    finished_at: Optional[str],
+    keyword_id: Optional[int] = None,
+) -> int:
+    """保存/更新清洗或答题任务（kind: clean / answer）"""
+    conn = get_connection()
+    try:
+        existing = conn.execute("SELECT id FROM ai_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE ai_tasks SET keyword_id=?, status=?, stats=?, steps=?, finished_at=?
+                   WHERE task_id=?""",
+                (keyword_id, status, json.dumps(stats, ensure_ascii=False),
+                 json.dumps(steps, ensure_ascii=False), finished_at, task_id),
+            )
+            conn.commit()
+            return existing["id"]
+        cur = conn.execute(
+            """INSERT INTO ai_tasks
+               (task_id, kind, keyword_id, keyword_name, status, stats, steps, started_at, finished_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (task_id, kind, keyword_id, keyword_name, status,
+             json.dumps(stats, ensure_ascii=False),
+             json.dumps(steps, ensure_ascii=False),
+             started_at, finished_at),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _parse_ai_row(row) -> dict:
+    item = dict(row)
+    for col in ("stats", "steps"):
+        if item.get(col):
+            try:
+                item[col] = json.loads(item[col])
+            except Exception:
+                pass
+    if isinstance(item.get("steps"), list):
+        item["steps_count"] = len(item["steps"])
+    return item
+
+
+def list_ai_tasks(kind: Optional[str] = None, limit: int = 100) -> list[dict]:
+    conn = get_connection()
+    try:
+        if kind:
+            rows = conn.execute(
+                "SELECT * FROM ai_tasks WHERE kind = ? ORDER BY started_at DESC LIMIT ?",
+                (kind, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM ai_tasks ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_parse_ai_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_ai_task(task_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM ai_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        return _parse_ai_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_ai_task(task_id: str):
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM ai_tasks WHERE task_id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_ai_tasks(kind: Optional[str] = None):
+    """清空 AI 任务日志；kind 为空时清空全部清洗/答题记录"""
+    conn = get_connection()
+    try:
+        if kind:
+            conn.execute("DELETE FROM ai_tasks WHERE kind = ?", (kind,))
+        else:
+            conn.execute("DELETE FROM ai_tasks")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_interrupted_ai_tasks() -> int:
+    """
+    服务启动时回收上次进程遗留的 running 记录。
+    进程被强杀/重启时收尾的落库不会执行，这些任务永远停在 running，
+    这里统一标记为 interrupted 并补一条说明，避免日志看起来「凭空消失」。
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT task_id, kind, steps FROM ai_tasks WHERE status = 'running'"
+        ).fetchall()
+        if not rows:
+            return 0
+        now = datetime.now().isoformat()
+        for r in rows:
+            try:
+                steps = json.loads(r["steps"] or "[]")
+            except Exception:
+                steps = []
+            steps.append({
+                "step": "interrupted", "phase": r["kind"] or "clean", "status": "skipped",
+                "message": "⚠️ 任务因服务重启中断，以上为中断前已保存的日志",
+                "current": 0, "total": 0, "extra": {},
+            })
+            conn.execute(
+                "UPDATE ai_tasks SET status='interrupted', steps=?, finished_at=? WHERE task_id=?",
+                (json.dumps(steps, ensure_ascii=False), now, r["task_id"]),
+            )
+        conn.commit()
+        return len(rows)
     finally:
         conn.close()

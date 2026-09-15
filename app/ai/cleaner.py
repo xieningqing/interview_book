@@ -5,7 +5,6 @@
 - 清洗结果落库：原文备份 raw_content，正文重写，questions 重建
 """
 import asyncio
-import json
 import logging
 import re
 from typing import Optional
@@ -17,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 # 送给模型的正文上限（字符），兼顾长文与 token 成本
 MAX_CONTENT_CHARS = 12000
+
+# 并发清洗数：并行调用大模型加快批量处理；过大易触发限流，2 为稳妥值
+CONCURRENCY = 2
 
 SYSTEM_PROMPT = """你是牛客面经数据清洗助手。你要处理的最小单位是「整篇面经」，不是单个问题。
 
@@ -44,25 +46,6 @@ SYSTEM_PROMPT = """你是牛客面经数据清洗助手。你要处理的最小�
 只输出一个 JSON 对象，不要输出任何解释或 markdown 代码块，格式：
 {"relevant": true 或 false, "qa": [{"q": "问题", "a": "答案"}]}
 不相关时 qa 输出空数组。"""
-
-
-def _extract_json(text: str) -> Optional[dict]:
-    """从模型输出中容错提取 JSON 对象"""
-    if not text:
-        return None
-    t = text.strip()
-    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.MULTILINE).strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return None
-    return None
 
 
 def _tidy_text(text: str) -> str:
@@ -117,10 +100,7 @@ async def clean_one(interview: dict, keyword: str) -> dict:
         f"面经正文：\n{content[:MAX_CONTENT_CHARS]}"
     )
 
-    raw = await llm.chat(SYSTEM_PROMPT, user_prompt)
-    data = _extract_json(raw)
-    if data is None:
-        raise RuntimeError("模型返回不是合法 JSON")
+    data = await llm.chat_json(SYSTEM_PROMPT, user_prompt)
 
     if not data.get("relevant", False):
         db.mark_interview_irrelevant(interview["id"], True)
@@ -158,37 +138,65 @@ async def clean_batch(
         emit("done", "success", "该关键词下没有需要清洗的面经", 0)
         return stats
 
-    for i, inv in enumerate(targets, 1):
-        if stop_event is not None and stop_event.is_set():
-            emit("done", "stopped",
-                 f"⏹️ 已停止：清洗 {stats['cleaned']}，不相关 {stats['irrelevant']}，失败 {stats['failed']}",
-                 i - 1, {"stopped": True, **stats})
-            return stats
+    # 立即回一条开始事件：首篇模型调用耗时较长，避免前端一直停在「准备中」
+    emit("start", "info",
+         f"🚀 共 {len(targets)} 篇待清洗，并发 {CONCURRENCY} 篇调用大模型（失败自动重试）", 0)
 
-        title = (inv.get("title") or "")[:40]
-        try:
-            result = await clean_one(inv, keyword_name)
-            if result["action"] == "irrelevant":
-                stats["irrelevant"] += 1
-                emit("clean_item", "skipped",
-                     f"🏷️ 与「{keyword_name}」不相关，已标记 {title}", i,
-                     {"title": title, "action": "irrelevant"})
+    # 并发执行：信号量限流，各篇完成后计数/发进度；任一篇失败只记该篇失败
+    sem = asyncio.Semaphore(CONCURRENCY)
+    processed = 0
+
+    async def work(inv):
+        nonlocal processed
+        async with sem:
+            title = (inv.get("title") or "")[:40]
+            # 模型返回前先告知当前处理项，单篇耗时长时界面不会像卡住
+            emit("clean_item", "info", f"⏳ 正在清洗 {title}", processed)
+            try:
+                result = await clean_one(inv, keyword_name)
+            except Exception as e:
+                # asyncio.CancelledError 是 BaseException，不会被这里捕获，取消正常传播
+                stats["failed"] += 1
+                logger.warning(f"清洗失败 id={inv['id']}: {e}")
+                processed += 1
+                emit("clean_item", "failed",
+                     f"❌ {title} —— {str(e)[:80]}", processed,
+                     {"title": title, "error": str(e)[:120], **stats})
             else:
-                stats["cleaned"] += 1
-                emit("clean_item", "success",
-                     f"✅ [{i}/{len(targets)}] 已清洗（{result['questions']} 问）{title}", i,
-                     {"title": title, "questions": result["questions"]})
-        except Exception as e:
-            stats["failed"] += 1
-            logger.warning(f"清洗失败 id={inv['id']}: {e}")
-            emit("clean_item", "failed",
-                 f"❌ [{i}/{len(targets)}] {title} —— {str(e)[:80]}", i,
-                 {"title": title, "error": str(e)[:120]})
+                if result["action"] == "irrelevant":
+                    stats["irrelevant"] += 1
+                    emit("clean_item", "skipped",
+                         f"🏷️ 与「{keyword_name}」不相关，已标记 {title}", processed,
+                         {"title": title, "action": "irrelevant", **stats})
+                else:
+                    stats["cleaned"] += 1
+                    emit("clean_item", "success",
+                         f"✅ 已清洗（{result['questions']} 问）{title}", processed,
+                         {"title": title, "questions": result["questions"], **stats})
+                processed += 1
+            # 请求间留出间隔，降低限流概率（任务被取消时 sleep 抛 CancelledError 向上传播）
+            await asyncio.sleep(0.3)
 
-        # 请求间留出间隔，降低限流概率
-        await asyncio.sleep(0.5)
+    pending = {asyncio.create_task(work(inv)) for inv in targets}
+    try:
+        while pending:
+            if stop_event is not None and stop_event.is_set():
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                emit("done", "stopped",
+                     f"⏹️ 已停止：清洗 {stats['cleaned']}，不相关 {stats['irrelevant']}，失败 {stats['failed']}",
+                     processed, {"stopped": True, **stats})
+                return stats
+            _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # main.py 停止/重启会 cancel 本任务：取消未完成的子任务后继续抛出
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
 
     emit("done", "success",
          f"🏁 清洗完成：有效 {stats['cleaned']}，不相关 {stats['irrelevant']}，失败 {stats['failed']}",
-         len(targets), stats)
+         processed, stats)
     return stats
